@@ -1,4 +1,4 @@
-exports.version = 0.8;
+exports.version = 0.1;
 exports.description = "RTMP Live Streaming - ingest via RTMP (OBS etc.), serve HTTP-FLV with HTML5 player";
 exports.apiRequired = 13;
 exports.repo = "feuerswut/hfs-streaming";
@@ -39,6 +39,7 @@ let _nms            = null;   // NodeMediaServer instance
 let _port           = 8979;   // kept in sync so proxy always knows where NMS listens
 let _debug          = false;  // toggled from config
 let _restoreConsole = null;   // cleanup fn for console intercept
+let _activeProxies  = new Set();
 
 function dbg(api, ...args) {
     if (_debug) api.log('[streaming]', ...args);
@@ -85,6 +86,7 @@ exports.init = api => {
     const gopCache  = api.getConfig('gopCache')         ?? true;
     _debug          = api.getConfig('debug')            ?? false;
     _port           = httpPort;
+    _restoreConsole = interceptConsole(api);
 
     // ── Load player.html from public/ ────────────────────────────────────────
     const playerHtmlPath = path.join(__dirname, 'public', 'player.html');
@@ -182,6 +184,18 @@ exports.init = api => {
                 _nms = null;
                 api.log('[streaming] NMS stopped');
             }
+            
+            // 1. Force-kill all active HTTP proxy connections to NMS
+            for (const req of _activeProxies) {
+                req.destroy();
+            }
+            _activeProxies.clear();
+            
+            // 2. Restore the original console behavior
+            if (_restoreConsole) {
+                _restoreConsole();
+                _restoreConsole = null;
+            }
         },
     };
 };
@@ -199,18 +213,25 @@ function proxyFlv(ctx, url) {
             ctx.set('X-Accel-Buffering',          'no');
             ctx.set('Access-Control-Allow-Origin','*');
 
-            ctx.body = res;                  // Koa pipes the stream
+            ctx.body = res;                  
             
             // Client disconnected (closed browser tab, etc.)
             ctx.req.on('close', () => {
-                req.destroy();               // <--- CRITICAL: Kill the upstream NMS connection
+                req.destroy();               
+                _activeProxies.delete(req); // <-- Clean up on client disconnect
                 resolve();
             }); 
             
-            res.on('end', resolve);
+            res.on('end', () => {
+                _activeProxies.delete(req); // <-- Clean up on stream end
+                resolve();
+            });
         });
 
+        _activeProxies.add(req); // <-- Track the request immediately
+
         req.on('error', () => {
+            _activeProxies.delete(req); // <-- Clean up on error
             ctx.status = 503;
             ctx.type   = 'application/json';
             ctx.body   = JSON.stringify({ error: 'Stream not available – is someone ingesting?' });
