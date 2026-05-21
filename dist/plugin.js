@@ -1,6 +1,6 @@
 // HFS v3 Streaming Plugin - MPEG-TS Multicast Streaming
-exports.version = 0.1;
-exports.description = "(BETA) MPEG-TS Streaming - Real-time multicast streaming to connected devices with RAM buffering";
+exports.version = 0.2;
+exports.description = "(BETA) MPEG-TS Streaming - multicast with RAM buffer, HTML5 player";
 exports.apiRequired = 8.65;
 
 exports.author = "feuerswut";
@@ -10,101 +10,108 @@ exports.config = {
     maxBufferSize: {
         type: 'number',
         defaultValue: 200,
-        helperText: "Maximum RAM buffer size in MB (default 200MB). Older fragments are discarded.",
+        helperText: "Max RAM buffer in MB (default 200). Older data discarded when full.",
         xs: 6,
     },
     streamPath: {
         type: 'string',
         defaultValue: '/live',
-        helperText: "Base path for streaming. Use '/live' for /live or '/' for root path streaming.",
+        helperText: "Base path: /live or /",
         xs: 6,
     },
     useSubhost: {
         type: 'boolean',
         defaultValue: false,
-        helperText: "Enable subdomain mode (e.g., live.example.com). Requires DNS setup.",
+        helperText: "Use subdomain mode (live.example.com) instead of path",
         xs: 6,
     },
     subhostName: {
         type: 'string',
         defaultValue: 'live',
-        helperText: "Subdomain name when useSubhost is enabled (e.g., 'live' for live.example.com).",
+        helperText: "Subdomain name (e.g., 'live' for live.example.com)",
+        xs: 6,
+    },
+    streamingKey: {
+        type: 'string',
+        defaultValue: '',
+        helperText: "Optional: require ?key=VALUE for ingest. Leave empty to disable.",
         xs: 6,
     },
     allowPublicIngest: {
         type: 'boolean',
         defaultValue: false,
-        helperText: "Allow anonymous users to ingest streams. Requires allowPublicAccess for viewers.",
+        helperText: "Allow anonymous ingest (when no streaming key set)",
         xs: 6,
     },
     allowedIngestUsers: {
         type: 'string',
         defaultValue: '',
-        helperText: "Comma-separated list of users/groups allowed to ingest (empty = all authenticated users).",
-        xs: 6,
-    },
-    chunkDuration: {
-        type: 'number',
-        defaultValue: 2000,
-        helperText: "TS chunk duration in milliseconds for buffering strategy.",
+        helperText: "Comma-separated users/groups allowed to ingest (empty = all authenticated)",
         xs: 6,
     },
     maxConnectedClients: {
         type: 'number',
         defaultValue: 100,
-        helperText: "Maximum concurrent stream clients. 0 = unlimited.",
+        helperText: "Max viewers. 0 = unlimited.",
+        xs: 6,
+    },
+    debug: {
+        type: 'boolean',
+        defaultValue: false,
+        helperText: "Enable debug logging",
         xs: 6,
     },
 };
 
 exports.changelog = [
-    { "version": 1.0, "message": "Initial release - MPEG-TS multicast streaming with RAM buffering" }
+    { "version": 0.1, "message": "BETA: HTML player, streaming keys, debug logging" }
 ];
 
 const path = require('path');
 const fs = require('fs');
 const { EventEmitter } = require('events');
 
+let DEBUG = false;
+
+function log(...args) {
+    if (DEBUG) {
+        console.log('[HFS-Streaming]', new Date().toISOString().split('T')[1], ...args);
+    }
+}
+
 /**
- * Circular buffer for RAM-based stream storage
+ * Circular buffer for RAM streaming
  */
 class CircularStreamBuffer extends EventEmitter {
     constructor(maxSizeBytes) {
         super();
         this.maxSize = maxSizeBytes;
         this.buffer = Buffer.allocUnsafe(maxSizeBytes);
-        this.chunks = []; // Array of {offset, size, timestamp, data}
+        this.chunks = [];
         this.currentOffset = 0;
         this.totalWritten = 0;
-        this.startSequence = 0;
+        log('Buffer created:', (maxSizeBytes / 1024 / 1024).toFixed(0) + 'MB');
     }
 
     write(data) {
         const dataSize = data.length;
         
-        // If data is larger than buffer, only keep the last part
         if (dataSize > this.maxSize) {
             const offset = dataSize - this.maxSize;
             return this.write(data.slice(offset));
         }
 
-        // Check if we need to wrap around
         if (this.currentOffset + dataSize > this.maxSize) {
-            // Write to end of buffer
             const firstPart = this.maxSize - this.currentOffset;
             data.copy(this.buffer, this.currentOffset, 0, firstPart);
-            // Write remainder to start
             data.copy(this.buffer, 0, firstPart);
             this.currentOffset = dataSize - firstPart;
         } else {
-            // Direct write
             data.copy(this.buffer, this.currentOffset);
             this.currentOffset = (this.currentOffset + dataSize) % this.maxSize;
         }
 
         this.totalWritten += dataSize;
-        
-        // Store chunk metadata
         this.chunks.push({
             offset: this.currentOffset,
             size: dataSize,
@@ -112,18 +119,14 @@ class CircularStreamBuffer extends EventEmitter {
             sequence: this.totalWritten
         });
 
-        // Cleanup old chunks that are overwritten
-        this.chunks = this.chunks.filter(chunk => {
-            const chunkEnd = (chunk.offset + chunk.size) % this.maxSize;
-            // Keep if chunk is still valid in the buffer
-            return chunk.sequence > (this.totalWritten - this.maxSize);
-        });
+        this.chunks = this.chunks.filter(chunk => 
+            chunk.sequence > (this.totalWritten - this.maxSize)
+        );
 
         this.emit('data', data);
     }
 
     getBufferedData() {
-        // Return all valid buffered data in order
         if (this.chunks.length === 0) return Buffer.alloc(0);
         
         let result = [];
@@ -131,13 +134,11 @@ class CircularStreamBuffer extends EventEmitter {
             if (chunk.offset + chunk.size <= this.buffer.length) {
                 result.push(this.buffer.slice(chunk.offset, chunk.offset + chunk.size));
             } else {
-                // Wrapped chunk
                 const firstPart = this.buffer.slice(chunk.offset);
                 const secondPart = this.buffer.slice(0, (chunk.offset + chunk.size) % this.maxSize);
                 result.push(Buffer.concat([firstPart, secondPart]));
             }
         }
-        
         return Buffer.concat(result);
     }
 
@@ -149,15 +150,17 @@ class CircularStreamBuffer extends EventEmitter {
         this.chunks = [];
         this.currentOffset = 0;
         this.totalWritten = 0;
+        log('Buffer cleared');
     }
 }
 
 /**
- * Streaming session manager
+ * Stream manager - handles buffering and subscriber broadcast
  */
 class StreamManager extends EventEmitter {
-    constructor(maxBufferMB) {
+    constructor(maxBufferMB, streamName) {
         super();
+        this.streamName = streamName;
         this.buffer = new CircularStreamBuffer(maxBufferMB * 1024 * 1024);
         this.subscribers = new Set();
         this.ingestActive = false;
@@ -168,52 +171,54 @@ class StreamManager extends EventEmitter {
             peakClients: 0,
             totalClients: 0,
         };
+        log(`StreamManager: ${streamName}`);
     }
 
     addSubscriber(ctx) {
         this.subscribers.add(ctx);
         this.stats.totalClients++;
         this.stats.peakClients = Math.max(this.stats.peakClients, this.subscribers.size);
-        this.emit('subscriber-added', this.subscribers.size);
+        log(`+ Subscriber: ${this.streamName} (total: ${this.subscribers.size})`);
         return () => this.removeSubscriber(ctx);
     }
 
     removeSubscriber(ctx) {
         this.subscribers.delete(ctx);
-        this.emit('subscriber-removed', this.subscribers.size);
+        log(`- Subscriber: ${this.streamName} (total: ${this.subscribers.size})`);
     }
 
     ingestData(data) {
         if (!this.ingestActive) {
             this.ingestActive = true;
             this.ingestStartTime = Date.now();
+            log(`>> Ingest started: ${this.streamName}`);
         }
+        
         this.stats.bytesIngested += data.length;
         this.buffer.write(data);
         this.broadcastToSubscribers(data);
     }
 
     broadcastToSubscribers(data) {
-        let activeSubscribers = [];
-        for (const subscriber of this.subscribers) {
+        let count = 0;
+        for (const sub of this.subscribers) {
             try {
-                subscriber.res.write(data);
+                sub.res.write(data);
                 this.stats.bytesStreamed += data.length;
-                activeSubscribers.push(subscriber);
+                count++;
             } catch (err) {
-                // Client disconnected, will be cleaned up
+                log(`Broadcast error: ${err.message}`);
             }
         }
-        return activeSubscribers.length;
-    }
-
-    startIngest() {
-        this.ingestActive = true;
-        this.ingestStartTime = Date.now();
+        return count;
     }
 
     stopIngest() {
-        this.ingestActive = false;
+        if (this.ingestActive) {
+            const duration = Date.now() - this.ingestStartTime;
+            log(`<< Ingest stopped: ${this.streamName} (${duration}ms)`);
+            this.ingestActive = false;
+        }
     }
 
     getStats() {
@@ -221,7 +226,7 @@ class StreamManager extends EventEmitter {
             ...this.stats,
             connectedClients: this.subscribers.size,
             bufferUsed: this.buffer.getSize(),
-            bufferUsedPercent: (this.buffer.getSize() / this.buffer.maxSize) * 100,
+            bufferPercent: Math.round((this.buffer.getSize() / this.buffer.maxSize) * 100),
             ingestActive: this.ingestActive,
             uptime: this.ingestActive ? Date.now() - this.ingestStartTime : 0,
         };
@@ -234,14 +239,13 @@ class StreamManager extends EventEmitter {
     }
 }
 
-// Global stream managers (one per stream)
 const streamManagers = new Map();
 
-function getStreamManager(streamName, maxBufferMB) {
-    if (!streamManagers.has(streamName)) {
-        streamManagers.set(streamName, new StreamManager(maxBufferMB));
+function getStreamManager(name, mb) {
+    if (!streamManagers.has(name)) {
+        streamManagers.set(name, new StreamManager(mb, name));
     }
-    return streamManagers.get(streamName);
+    return streamManagers.get(name);
 }
 
 exports.init = async api => {
@@ -249,136 +253,151 @@ exports.init = async api => {
     const getCurrentUsername = auth.getCurrentUsername;
     const getGroupsForUser = auth.getGroupsForUser;
 
+    DEBUG = api.getConfig('debug') || false;
+    log('Plugin loaded');
+
     return { middleware };
 
     async function middleware(ctx) {
-        const config = {
+        const cfg = {
             maxBufferSize: api.getConfig('maxBufferSize') || 200,
             streamPath: api.getConfig('streamPath') || '/live',
             useSubhost: api.getConfig('useSubhost') || false,
             subhostName: api.getConfig('subhostName') || 'live',
+            streamingKey: api.getConfig('streamingKey') || '',
             allowPublicIngest: api.getConfig('allowPublicIngest') || false,
             allowedIngestUsers: api.getConfig('allowedIngestUsers') || '',
-            chunkDuration: api.getConfig('chunkDuration') || 2000,
             maxConnectedClients: api.getConfig('maxConnectedClients') || 100,
         };
 
         const url = ctx.req.url;
         const host = ctx.get('host');
+        const method = ctx.method;
 
-        // Determine if request is for streaming based on host or path
-        let isStreamingRequest = false;
-        let streamName = null;
+        // Determine if this is a streaming request
+        let isStreaming = false;
+        let streamName = 'main';
 
-        if (config.useSubhost) {
-            // Check for subdomain mode (live.example.com)
-            const hostParts = host.split('.');
-            if (hostParts[0] === config.subhostName) {
-                isStreamingRequest = true;
-                streamName = 'main'; // Default stream name for subhost
+        if (cfg.useSubhost) {
+            const subdomain = host.split('.')[0];
+            if (subdomain === cfg.subhostName) {
+                isStreaming = true;
             }
         } else {
-            // Check for path mode (/live or configured path)
-            if (url.startsWith(config.streamPath)) {
-                isStreamingRequest = true;
-                // Extract stream name from path: /live/stream1 -> stream1
-                const pathParts = url.substring(config.streamPath.length).split('/').filter(p => p);
-                streamName = pathParts[0] || 'main';
+            if (url.startsWith(cfg.streamPath)) {
+                isStreaming = true;
+                const parts = url.substring(cfg.streamPath.length).split('/').filter(p => p);
+                streamName = parts[0] || 'main';
             }
         }
 
-        if (!isStreamingRequest) {
-            return; // Not a streaming request
-        }
+        if (!isStreaming) return;
 
-        const manager = getStreamManager(streamName, config.maxBufferSize);
-        
-        // Ingest endpoints (POST/PUT)
-        if (ctx.method === 'POST' || ctx.method === 'PUT') {
-            // Check ingest authorization
-            const username = getCurrentUsername(ctx);
-            
-            if (!username && !config.allowPublicIngest) {
-                ctx.status = 403;
-                ctx.body = JSON.stringify({ error: 'Authentication required for ingest' });
-                ctx.type = 'application/json';
-                ctx.stop();
-                return;
-            }
+        log(`${method} ${url} | ${streamName}`);
 
-            // Check if user is allowed to ingest
-            if (config.allowedIngestUsers && username) {
-                const allowedList = config.allowedIngestUsers
-                    .split(',')
-                    .map(s => s.trim())
-                    .filter(s => s);
+        const manager = getStreamManager(streamName, cfg.maxBufferSize);
+
+        // ============ INGEST (POST/PUT) ============
+        if (method === 'POST' || method === 'PUT') {
+            log(`Ingest request`);
+
+            // Check streaming key
+            if (cfg.streamingKey) {
+                if (ctx.query.key !== cfg.streamingKey) {
+                    log(`Ingest DENIED: bad key`);
+                    ctx.status = 401;
+                    ctx.body = { error: 'Invalid key' };
+                    ctx.type = 'application/json';
+                    ctx.stop();
+                    return;
+                }
+                log(`Ingest auth: key OK`);
+            } else {
+                // No key: check HFS auth
+                const user = getCurrentUsername(ctx);
                 
-                if (allowedList.length > 0) {
-                    const userGroups = getGroupsForUser ? await getGroupsForUser(username) : [];
-                    const isAllowed = allowedList.includes(username) || 
-                                    allowedList.some(allowed => userGroups.includes(allowed));
-                    
-                    if (!isAllowed) {
-                        ctx.status = 403;
-                        ctx.body = JSON.stringify({ error: 'User not allowed to ingest' });
-                        ctx.type = 'application/json';
-                        ctx.stop();
-                        return;
+                if (!user && !cfg.allowPublicIngest) {
+                    log(`Ingest DENIED: no auth`);
+                    ctx.status = 403;
+                    ctx.body = { error: 'Auth required' };
+                    ctx.type = 'application/json';
+                    ctx.stop();
+                    return;
+                }
+
+                // Check user whitelist
+                if (cfg.allowedIngestUsers && user) {
+                    const allowed = cfg.allowedIngestUsers.split(',').map(s => s.trim()).filter(s => s);
+                    if (allowed.length > 0) {
+                        const groups = getGroupsForUser ? await getGroupsForUser(user) : [];
+                        const ok = allowed.includes(user) || allowed.some(g => groups.includes(g));
+                        
+                        if (!ok) {
+                            log(`Ingest DENIED: user ${user} not allowed`);
+                            ctx.status = 403;
+                            ctx.body = { error: 'Not allowed' };
+                            ctx.type = 'application/json';
+                            ctx.stop();
+                            return;
+                        }
                     }
                 }
+
+                log(`Ingest auth: user=${user}`);
             }
 
-            // Handle ingest endpoint
-            if (url.endsWith('/ingest') || 
-                (config.streamPath === '/' && url === '/ingest') ||
-                (config.useSubhost && url === '/')) {
-                
-                manager.startIngest();
-                ctx.type = 'application/octet-stream';
-                ctx.status = 200;
+            // Accept ingest
+            manager.startIngest();
+            ctx.status = 200;
+            ctx.type = 'application/octet-stream';
 
-                // Read stream data and buffer it
-                ctx.req.on('data', (chunk) => {
-                    manager.ingestData(chunk);
-                });
+            ctx.req.on('data', chunk => {
+                manager.ingestData(chunk);
+            });
 
-                ctx.req.on('end', () => {
-                    manager.stopIngest();
-                });
+            ctx.req.on('end', () => manager.stopIngest());
+            ctx.req.on('error', err => {
+                log(`Ingest error: ${err.message}`);
+                manager.stopIngest();
+            });
 
-                ctx.req.on('error', (err) => {
-                    console.error('Ingest error:', err);
-                    manager.stopIngest();
-                });
-
-                // Keep connection open
-                ctx.body = new Promise(() => {});
-                ctx.stop();
-                return;
-            }
-
-            ctx.status = 404;
+            ctx.body = new Promise(() => {});
             ctx.stop();
             return;
         }
 
-        // Stream viewing endpoints (GET)
-        if (ctx.method === 'GET') {
-            // Check view authorization
-            const username = getCurrentUsername(ctx);
-            
-            // Serve main stream or specific stream
-            const serveStream = (url.endsWith('/stream') || 
-                               url === config.streamPath || 
-                               url === config.streamPath + '/' ||
-                               (config.useSubhost && url === '/') ||
-                               (config.useSubhost && url === '/'));
+        // ============ VIEWING (GET) ============
+        if (method === 'GET') {
+            // Serve player HTML
+            if (url === cfg.streamPath || url === cfg.streamPath + '/' || 
+                (cfg.useSubhost && (url === '/' || url === ''))) {
+                
+                log(`Serving player`);
+                const playerPath = path.join(__dirname, 'public', 'player.html');
+                
+                if (fs.existsSync(playerPath)) {
+                    const html = fs.readFileSync(playerPath, 'utf8');
+                    ctx.type = 'text/html; charset=utf-8';
+                    ctx.body = html;
+                } else {
+                    log(`Player HTML not found: ${playerPath}`);
+                    ctx.status = 404;
+                    ctx.body = 'player.html not found';
+                }
+                ctx.stop();
+                return;
+            }
 
-            if (serveStream) {
-                // Check client limit
-                if (config.maxConnectedClients > 0 && manager.subscribers.size >= config.maxConnectedClients) {
+            // Stream endpoint
+            if (url === cfg.streamPath + '/' + streamName + '/stream' || 
+                (cfg.useSubhost && url === '/?raw=1')) {
+                
+                log(`Stream request`);
+                
+                if (cfg.maxConnectedClients > 0 && manager.subscribers.size >= cfg.maxConnectedClients) {
+                    log(`Stream DENIED: max clients`);
                     ctx.status = 503;
-                    ctx.body = JSON.stringify({ error: 'Maximum concurrent clients reached' });
+                    ctx.body = { error: 'Max clients reached' };
                     ctx.type = 'application/json';
                     ctx.stop();
                     return;
@@ -387,82 +406,63 @@ exports.init = async api => {
                 ctx.type = 'video/mp2t';
                 ctx.set('Cache-Control', 'no-cache, no-store, must-revalidate');
                 ctx.set('Connection', 'keep-alive');
-                ctx.set('Content-Type', 'video/mp2t');
                 ctx.status = 200;
 
-                // Send buffered data first
                 const buffered = manager.buffer.getBufferedData();
                 if (buffered.length > 0) {
                     ctx.res.write(buffered);
                 }
 
-                // Subscribe to new data
-                const unsubscribe = manager.addSubscriber(ctx);
+                const unsub = manager.addSubscriber(ctx);
 
-                ctx.req.on('close', () => {
-                    unsubscribe();
-                });
+                ctx.req.on('close', unsub);
+                ctx.req.on('error', unsub);
 
-                ctx.req.on('error', () => {
-                    unsubscribe();
-                });
-
-                // Keep connection open
                 ctx.body = new Promise(() => {});
                 ctx.stop();
                 return;
             }
 
-            // Stats endpoint
-            if (url.endsWith('/stats') || url === config.streamPath + '/stats') {
-                const stats = manager.getStats();
+            // Stats
+            if (url.includes('/stats')) {
                 ctx.type = 'application/json';
-                ctx.body = JSON.stringify(stats, null, 2);
+                ctx.body = manager.getStats();
                 ctx.stop();
                 return;
             }
 
-            // Health check endpoint
-            if (url.endsWith('/health') || url === config.streamPath + '/health') {
+            // Health
+            if (url.includes('/health')) {
                 ctx.type = 'application/json';
-                ctx.body = JSON.stringify({
-                    status: 'ok',
+                ctx.body = {
+                    ok: true,
                     streaming: manager.ingestActive,
                     clients: manager.subscribers.size
-                });
+                };
                 ctx.stop();
                 return;
             }
 
-            // Clear buffer endpoint (admin only)
-            if ((ctx.method === 'DELETE' || ctx.method === 'POST') && url.endsWith('/clear')) {
-                // You can add admin check here if needed
+            // Clear buffer
+            if (url.includes('/clear')) {
                 manager.clear();
                 ctx.type = 'application/json';
-                ctx.body = JSON.stringify({ message: 'Buffer cleared' });
+                ctx.body = { ok: true };
                 ctx.stop();
                 return;
             }
-        }
 
-        // Default stream list endpoint
-        if ((url === config.streamPath || url === config.streamPath + '/') && ctx.method === 'GET') {
-            const streams = Array.from(streamManagers.entries()).map(([name, mgr]) => ({
-                name,
-                stats: mgr.getStats()
-            }));
-
-            ctx.type = 'application/json';
-            ctx.body = JSON.stringify({
-                streams,
-                config: {
-                    maxBufferSize: config.maxBufferSize,
-                    streamPath: config.streamPath,
-                    useSubhost: config.useSubhost,
-                }
-            }, null, 2);
-            ctx.stop();
-            return;
+            // List streams
+            if (url === cfg.streamPath || url === cfg.streamPath + '/') {
+                const streams = Array.from(streamManagers.entries()).map(([name, m]) => ({
+                    name,
+                    ...m.getStats()
+                }));
+                ctx.type = 'application/json';
+                ctx.body = { streams };
+                ctx.stop();
+                return;
+            }
         }
     }
 };
