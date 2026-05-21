@@ -1,5 +1,5 @@
 // HFS v3 Streaming Plugin - MPEG-TS Multicast Streaming
-exports.version = 0.2;
+exports.version = 0.3;
 exports.description = "(BETA) MPEG-TS Streaming - multicast with RAM buffer, HTML5 player";
 exports.apiRequired = 8.65;
 
@@ -76,6 +76,55 @@ let DEBUG = false;
 function log(...args) {
     if (DEBUG) {
         console.log('[HFS-Streaming]', new Date().toISOString().split('T')[1], ...args);
+    }
+}
+
+/**
+ * Serve static files from public directory
+ */
+function serveStatic(ctx, filePath) {
+    try {
+        const full     = filePath || path.join(__dirname, 'public', 'player.html');
+        const resolved = path.resolve(full);
+
+        // Security: prevent directory traversal
+        if (!resolved.startsWith(path.resolve(__dirname) + path.sep) &&
+             resolved !== path.resolve(__dirname)) {
+            ctx.status = 403;
+            ctx.type = 'text/plain';
+            ctx.body = 'Forbidden';
+            ctx.stop();
+            return;
+        }
+
+        if (!fs.existsSync(resolved)) {
+            ctx.status = 404;
+            ctx.type = 'text/plain';
+            ctx.body = 'Not found';
+            ctx.stop();
+            return;
+        }
+
+        const types = {
+            '.html': 'text/html; charset=utf-8',
+            '.css': 'text/css',
+            '.js': 'application/javascript',
+            '.json': 'application/json',
+            '.png': 'image/png',
+            '.svg': 'image/svg+xml',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+        };
+        
+        ctx.type = types[path.extname(resolved)] || 'text/plain';
+        ctx.set('Cache-Control', 'no-cache');
+        ctx.body = ctx.type.startsWith('image/') ? fs.createReadStream(resolved) : fs.readFileSync(resolved, 'utf8');
+        ctx.stop();
+    } catch (err) {
+        ctx.status = 500;
+        ctx.type = 'text/plain';
+        ctx.body = 'Error: ' + err.message;
+        ctx.stop();
     }
 }
 
@@ -270,7 +319,7 @@ exports.init = async api => {
             maxConnectedClients: api.getConfig('maxConnectedClients') || 100,
         };
 
-        const url = ctx.req.url;
+        const url = ctx.req.url.split('?')[0];
         const host = ctx.get('host');
         const method = ctx.method;
 
@@ -296,6 +345,20 @@ exports.init = async api => {
         log(`${method} ${url} | ${streamName}`);
 
         const manager = getStreamManager(streamName, cfg.maxBufferSize);
+        const base = cfg.streamPath;
+
+        // ============ STATIC FILES (HTML) ============
+        if (url === base || url === base + '/') {
+            return serveStatic(ctx);
+        }
+
+        if (url.startsWith(base + '/') && !url.includes('/stream') && !url.includes('/ingest') && method === 'GET') {
+            const rel = url.slice(base.length + 1);
+            if (rel && !rel.startsWith('api') && !rel.startsWith('stream') && !rel.startsWith('ingest')) {
+                const filePath = path.join(__dirname, 'public', rel);
+                return serveStatic(ctx, filePath);
+            }
+        }
 
         // ============ INGEST (POST/PUT) ============
         if (method === 'POST' || method === 'PUT') {
@@ -306,7 +369,7 @@ exports.init = async api => {
                 if (ctx.query.key !== cfg.streamingKey) {
                     log(`Ingest DENIED: bad key`);
                     ctx.status = 401;
-                    ctx.body = { error: 'Invalid key' };
+                    ctx.body = JSON.stringify({ error: 'Invalid key' });
                     ctx.type = 'application/json';
                     ctx.stop();
                     return;
@@ -319,7 +382,7 @@ exports.init = async api => {
                 if (!user && !cfg.allowPublicIngest) {
                     log(`Ingest DENIED: no auth`);
                     ctx.status = 403;
-                    ctx.body = { error: 'Auth required' };
+                    ctx.body = JSON.stringify({ error: 'Auth required' });
                     ctx.type = 'application/json';
                     ctx.stop();
                     return;
@@ -335,7 +398,7 @@ exports.init = async api => {
                         if (!ok) {
                             log(`Ingest DENIED: user ${user} not allowed`);
                             ctx.status = 403;
-                            ctx.body = { error: 'Not allowed' };
+                            ctx.body = JSON.stringify({ error: 'Not allowed' });
                             ctx.type = 'application/json';
                             ctx.stop();
                             return;
@@ -366,38 +429,18 @@ exports.init = async api => {
             return;
         }
 
-        // ============ VIEWING (GET) ============
+        // ============ STREAMING (GET) ============
         if (method === 'GET') {
-            // Serve player HTML
-            if (url === cfg.streamPath || url === cfg.streamPath + '/' || 
-                (cfg.useSubhost && (url === '/' || url === ''))) {
-                
-                log(`Serving player`);
-                const playerPath = path.join(__dirname, 'public', 'player.html');
-                
-                if (fs.existsSync(playerPath)) {
-                    const html = fs.readFileSync(playerPath, 'utf8');
-                    ctx.type = 'text/html; charset=utf-8';
-                    ctx.body = html;
-                } else {
-                    log(`Player HTML not found: ${playerPath}`);
-                    ctx.status = 404;
-                    ctx.body = 'player.html not found';
-                }
-                ctx.stop();
-                return;
-            }
-
             // Stream endpoint
-            if (url === cfg.streamPath + '/' + streamName + '/stream' || 
-                (cfg.useSubhost && url === '/?raw=1')) {
+            if (url === base + '/' + streamName + '/stream' || 
+                (cfg.useSubhost && (url === '/' || url === ''))) {
                 
                 log(`Stream request`);
                 
                 if (cfg.maxConnectedClients > 0 && manager.subscribers.size >= cfg.maxConnectedClients) {
                     log(`Stream DENIED: max clients`);
                     ctx.status = 503;
-                    ctx.body = { error: 'Max clients reached' };
+                    ctx.body = JSON.stringify({ error: 'Max clients reached' });
                     ctx.type = 'application/json';
                     ctx.stop();
                     return;
@@ -426,7 +469,7 @@ exports.init = async api => {
             // Stats
             if (url.includes('/stats')) {
                 ctx.type = 'application/json';
-                ctx.body = manager.getStats();
+                ctx.body = JSON.stringify(manager.getStats());
                 ctx.stop();
                 return;
             }
@@ -434,11 +477,11 @@ exports.init = async api => {
             // Health
             if (url.includes('/health')) {
                 ctx.type = 'application/json';
-                ctx.body = {
+                ctx.body = JSON.stringify({
                     ok: true,
                     streaming: manager.ingestActive,
                     clients: manager.subscribers.size
-                };
+                });
                 ctx.stop();
                 return;
             }
@@ -447,19 +490,7 @@ exports.init = async api => {
             if (url.includes('/clear')) {
                 manager.clear();
                 ctx.type = 'application/json';
-                ctx.body = { ok: true };
-                ctx.stop();
-                return;
-            }
-
-            // List streams
-            if (url === cfg.streamPath || url === cfg.streamPath + '/') {
-                const streams = Array.from(streamManagers.entries()).map(([name, m]) => ({
-                    name,
-                    ...m.getStats()
-                }));
-                ctx.type = 'application/json';
-                ctx.body = { streams };
+                ctx.body = JSON.stringify({ ok: true });
                 ctx.stop();
                 return;
             }
