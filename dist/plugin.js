@@ -1,4 +1,4 @@
-exports.version = 0.6;
+exports.version = 0.7;
 exports.description = "RTMP Live Streaming - ingest via RTMP (OBS etc.), serve HTTP-FLV with HTML5 player";
 exports.apiRequired = 13;
 exports.repo = "feuerswut/hfs-streaming";
@@ -22,7 +22,7 @@ exports.config = {
     },
     debug: {
         type: 'boolean', defaultValue: false,
-        helperText: "Log ingest events (accepted / rejected publishes)", xs: 6,
+        helperText: "Pipe NMS internal logs + ingest events into HFS output panel", xs: 6,
     },
 };
 
@@ -35,12 +35,43 @@ const http = require('http');
 const path = require('path');
 const fs   = require('fs');
 
-let _nms   = null;   // NodeMediaServer instance
-let _port  = 8979;   // kept in sync so proxy always knows where NMS listens
-let _debug = false;  // toggled from config
+let _nms            = null;   // NodeMediaServer instance
+let _port           = 8979;   // kept in sync so proxy always knows where NMS listens
+let _debug          = false;  // toggled from config
+let _restoreConsole = null;   // cleanup fn for console intercept
 
 function dbg(api, ...args) {
     if (_debug) api.log('[streaming]', ...args);
+}
+
+// Intercept Node's console so NMS's internal log lines appear in the HFS
+// output panel.  NMS writes via console.log / console.error directly.
+// We wrap both, prepend [nms], forward to api.log, then call the original.
+// Returns a restore function to be called on unload.
+function interceptConsole(api) {
+    const origLog   = console.log;
+    const origError = console.error;
+    const origWarn  = console.warn;
+
+    const wrap = (orig, level) => (...args) => {
+        orig(...args);   // always keep original stdout output
+        try {
+            const line = args.map(a =>
+                (typeof a === 'object' ? JSON.stringify(a) : String(a))
+            ).join(' ');
+            api.log(`[nms${level}] ${line}`);
+        } catch (_) { /* never let logging crash the plugin */ }
+    };
+
+    console.log   = wrap(origLog,   '');
+    console.error = wrap(origError, ':error');
+    console.warn  = wrap(origWarn,  ':warn');
+
+    return () => {
+        console.log   = origLog;
+        console.error = origError;
+        console.warn  = origWarn;
+    };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
