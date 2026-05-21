@@ -1,260 +1,247 @@
-exports.version = 0.3;
-exports.description = "(BETA) MPEG-TS Streaming - multicast with RAM buffer, HTML5 player";
+exports.version = 0.10;
+exports.description = "RTMP Live Streaming - ingest via RTMP (OBS etc.), serve HTTP-FLV with HTML5 player";
 exports.apiRequired = 13;
-exports.author = "feuerswut";
 exports.repo = "feuerswut/hfs-streaming";
 
 exports.config = {
-    maxBufferSize: {
-        type: 'number', defaultValue: 50,
-        helperText: "Max RAM buffer in MB.", xs: 6,
+    rtmpPort: {
+        type: 'number', defaultValue: 1935,
+        helperText: "RTMP ingest port (point OBS / ffmpeg here)", xs: 6,
     },
-    streamingKey: {
-        type: 'string', defaultValue: '',
-        helperText: "Require ?key=VALUE for ingest. Leave empty to disable.", xs: 6,
+    internalHttpPort: {
+        type: 'number', defaultValue: 8979,
+        helperText: "Internal NMS HTTP port (not exposed publicly – pick any free port)", xs: 6,
     },
-    allowPublicIngest: {
-        type: 'boolean', defaultValue: false,
-        helperText: "Allow anonymous ingest (when no streaming key set)", xs: 6,
+    streamKey: {
+        type: 'string', defaultValue: 'stream',
+        helperText: "Stream key. In OBS set Stream Key to this value.", xs: 6,
     },
-    allowedIngestUsers: {
-        type: 'string', defaultValue: '',
-        helperText: "Comma-separated users allowed to ingest (empty = all authenticated)", xs: 6,
-    },
-    maxConnectedClients: {
-        type: 'number', defaultValue: 100,
-        helperText: "Max viewers. 0 = unlimited.", xs: 6,
-    },
-    debug: {
-        type: 'boolean', defaultValue: false,
-        helperText: "Enable debug logging", xs: 6,
+    gopCache: {
+        type: 'boolean', defaultValue: true,
+        helperText: "Cache last keyframe group so new viewers get a frame instantly", xs: 6,
     },
 };
 
 exports.changelog = [
-    { version: 0.6, message: "Fix startup crash: replaced pre-allocated circular buffer with dynamic chunk list" },
-    { version: 0.5, message: "Simplified routing, working middleware pattern" },
+    { version: 0.10, message: "Switched ingest to node-media-server (RTMP). HTTP-FLV output via mpegts.js player." },
 ];
 
-const path = require('path');
-const fs   = require('fs');
+// ─────────────────────────────────────────────────────────────────────────────
+const http = require('http');
 
-let DEBUG = false;
-function dbg(...args) {
-    if (DEBUG) console.log('[streaming]', new Date().toISOString().split('T')[1], ...args);
-}
+let _nms  = null;   // NodeMediaServer instance
+let _port = 8979;   // kept in sync so proxy always knows where NMS listens
 
-function jsonOk(ctx, payload) {
-    ctx.type = 'application/json';
-    ctx.set('Cache-Control', 'no-cache');
-    ctx.body = JSON.stringify(payload);
-    return true;
-}
-function jsonErr(ctx, status, msg) {
-    ctx.status = status;
-    ctx.type   = 'application/json';
-    ctx.body   = JSON.stringify({ error: msg });
-    return true;
-}
-
-// ── Simple chunk-list buffer (no upfront allocation) ─────────────────────────
-class StreamBuffer {
-    constructor(maxSizeBytes) {
-        this.maxSize  = maxSizeBytes;
-        this.chunks   = [];
-        this.byteSize = 0;
-    }
-
-    write(data) {
-        this.chunks.push(data);
-        this.byteSize += data.length;
-        // Evict oldest chunks when over limit
-        while (this.byteSize > this.maxSize && this.chunks.length > 0) {
-            this.byteSize -= this.chunks.shift().length;
-        }
-    }
-
-    getBufferedData() {
-        return this.chunks.length ? Buffer.concat(this.chunks) : Buffer.alloc(0);
-    }
-
-    clear() {
-        this.chunks   = [];
-        this.byteSize = 0;
-    }
-}
-
-// ── Stream manager ────────────────────────────────────────────────────────────
-class StreamManager {
-    constructor() {
-        this.buffer          = null; // created lazily with config value
-        this.subscribers     = new Set();
-        this.ingestActive    = false;
-        this.ingestStartTime = null;
-        this.stats           = { bytesIngested: 0, bytesStreamed: 0, peakClients: 0, totalClients: 0 };
-    }
-
-    ensureBuffer(maxBufferMB) {
-        if (!this.buffer) this.buffer = new StreamBuffer(maxBufferMB * 1024 * 1024);
-    }
-
-    addSubscriber(ctx) {
-        this.subscribers.add(ctx);
-        this.stats.totalClients++;
-        this.stats.peakClients = Math.max(this.stats.peakClients, this.subscribers.size);
-        dbg(`+ subscriber (total: ${this.subscribers.size})`);
-        return () => { this.subscribers.delete(ctx); dbg(`- subscriber (total: ${this.subscribers.size})`); };
-    }
-
-    ingestData(chunk) {
-        if (!this.ingestActive) {
-            this.ingestActive    = true;
-            this.ingestStartTime = Date.now();
-            dbg('ingest started');
-        }
-        this.stats.bytesIngested += chunk.length;
-        if (this.buffer) this.buffer.write(chunk);
-        for (const sub of this.subscribers) {
-            try {
-                sub.res.write(chunk);
-                this.stats.bytesStreamed += chunk.length;
-            } catch (e) {
-                dbg('broadcast error:', e.message);
-                this.subscribers.delete(sub);
-            }
-        }
-    }
-
-    stopIngest() {
-        if (this.ingestActive) {
-            dbg('ingest stopped');
-            this.ingestActive = false;
-        }
-    }
-
-    getStats() {
-        return {
-            ...this.stats,
-            connectedClients: this.subscribers.size,
-            bufferUsed:       this.buffer?.byteSize ?? 0,
-            bufferMax:        this.buffer?.maxSize   ?? 0,
-            bufferPercent:    this.buffer ? Math.round((this.buffer.byteSize / this.buffer.maxSize) * 100) : 0,
-            ingestActive:     this.ingestActive,
-            uptime:           this.ingestActive ? Date.now() - this.ingestStartTime : 0,
-        };
-    }
-
-    clear() {
-        this.buffer?.clear();
-        this.subscribers.clear();
-        this.ingestActive = false;
-    }
-}
-
-const manager = new StreamManager();
-
-// ── Plugin init ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 exports.init = api => {
-    DEBUG = api.getConfig('debug') || false;
 
-    let playerHtml;
-    try {
-        playerHtml = fs.readFileSync(path.join(__dirname, 'public', 'player.html'), 'utf8');
-        dbg('player.html loaded');
-    } catch (e) {
-        api.log('Error loading player.html:', e.message);
-    }
+    const NodeMediaServer = require('node-media-server');
 
+    const rtmpPort  = api.getConfig('rtmpPort')        || 1935;
+    const httpPort  = api.getConfig('internalHttpPort')|| 8979;
+    const streamKey = api.getConfig('streamKey')       || 'stream';
+    const gopCache  = api.getConfig('gopCache')        ?? true;
+
+    _port = httpPort;
+
+    // ── Start NMS ────────────────────────────────────────────────────────────
+    _nms = new NodeMediaServer({
+        logType: 1,   // 1 = errors only; set 3 for verbose
+        rtmp: {
+            port:         rtmpPort,
+            chunk_size:   60000,
+            gop_cache:    gopCache,
+            ping:         30,
+            ping_timeout: 60,
+        },
+        http: {
+            port:         httpPort,
+            allow_origin: '*',
+        },
+    });
+
+    // Enforce stream key on every publish attempt
+    _nms.on('prePublish', (id, streamPath /*, args */) => {
+        const incomingKey = streamPath.split('/').pop();
+        if (incomingKey !== streamKey) {
+            api.log(`[streaming] rejected publish: bad key "${incomingKey}"`);
+            const session = _nms.getSession(id);
+            if (session) session.reject();
+        }
+    });
+
+    _nms.run();
+    api.log(`[streaming] RTMP listening on :${rtmpPort}  |  NMS HTTP on :${httpPort}`);
+    api.log(`[streaming] OBS → rtmp://THIS_SERVER:${rtmpPort}/live/${streamKey}`);
+
+    // ── Player HTML (inlined – no public/ file needed) ───────────────────────
+    const playerHtml = buildPlayerHtml(streamKey);
+
+    // ── HFS middleware ────────────────────────────────────────────────────────
     exports.middleware = async ctx => {
+
+        // Match any path that contains /live (works behind reverse-proxies)
         const liveIdx = ctx.path.indexOf('/live');
         if (liveIdx === -1) return;
 
-        const sub    = ctx.path.slice(liveIdx + 5);
+        const sub    = ctx.path.slice(liveIdx + 5);  // e.g. "" | "/stream"
         const method = ctx.method.toUpperCase();
 
-        dbg(`${method} ${ctx.path} sub="${sub}"`);
-
-        // ── GET /live → player ────────────────────────────────────────────────
+        // GET /live  →  player page
         if (method === 'GET' && (sub === '' || sub === '/')) {
-            if (!playerHtml) return jsonErr(ctx, 500, 'player.html not found');
             ctx.status = 200;
             ctx.type   = 'text/html';
             ctx.body   = playerHtml;
-            return true;
-        }
-
-        // ── GET /live/stats ───────────────────────────────────────────────────
-        if (method === 'GET' && sub === '/stats') return jsonOk(ctx, manager.getStats());
-
-        // ── GET /live/health ──────────────────────────────────────────────────
-        if (method === 'GET' && sub === '/health')
-            return jsonOk(ctx, { ok: true, streaming: manager.ingestActive, clients: manager.subscribers.size });
-
-        // ── GET /live/clear ───────────────────────────────────────────────────
-        if (method === 'GET' && sub === '/clear') {
-            manager.clear();
-            return jsonOk(ctx, { ok: true });
-        }
-
-        // ── POST/PUT → ingest ─────────────────────────────────────────────────
-        if (method === 'POST' || method === 'PUT') {
-            const streamingKey       = api.getConfig('streamingKey')       || '';
-            const allowPublicIngest  = api.getConfig('allowPublicIngest')  ?? false;
-            const allowedIngestUsers = api.getConfig('allowedIngestUsers') || '';
-
-            if (streamingKey) {
-                const qs  = ctx.req.url.includes('?') ? ctx.req.url.slice(ctx.req.url.indexOf('?') + 1) : '';
-                const key = new URLSearchParams(qs).get('key');
-                if (key !== streamingKey) { dbg('ingest denied: bad key'); return jsonErr(ctx, 401, 'Invalid streaming key'); }
-                dbg('ingest auth: key ok');
-            } else {
-                const { getCurrentUsername } = api.require('./auth');
-                const user = getCurrentUsername(ctx);
-                if (!user && !allowPublicIngest) return jsonErr(ctx, 403, 'Authentication required');
-                if (user && allowedIngestUsers) {
-                    const allowed = allowedIngestUsers.split(',').map(s => s.trim()).filter(Boolean);
-                    if (allowed.length && !allowed.includes(user)) return jsonErr(ctx, 403, 'User not allowed to ingest');
-                }
-                dbg(`ingest auth: user=${user || '(anonymous)'}`);
-            }
-
-            manager.ensureBuffer(api.getConfig('maxBufferSize') || 50);
-
-            ctx.status = 200;
-            ctx.type   = 'application/octet-stream';
-            ctx.set('Cache-Control', 'no-cache');
-            ctx.req.on('data',  chunk => manager.ingestData(chunk));
-            ctx.req.on('end',   ()    => manager.stopIngest());
-            ctx.req.on('error', err   => { dbg('ingest error:', err.message); manager.stopIngest(); });
-            ctx.body = new Promise(resolve => { ctx.req.on('close', resolve); ctx.req.on('end', resolve); });
             ctx.stop();
             return;
         }
 
-        // ── GET /live/stream (or anything else) → serve stream ────────────────
-        if (method === 'GET') {
-            const max = api.getConfig('maxConnectedClients') ?? 100;
-            if (max > 0 && manager.subscribers.size >= max) return jsonErr(ctx, 503, 'Maximum viewers reached');
+        // GET /live/stream  →  proxy HTTP-FLV from NMS
+        if (method === 'GET' && sub === '/stream') {
+            const nmsUrl = `http://127.0.0.1:${_port}/live/${streamKey}.flv`;
+            await proxyFlv(ctx, nmsUrl);
+            ctx.stop();
+            return;
+        }
 
-            manager.ensureBuffer(api.getConfig('maxBufferSize') || 50);
-
-            ctx.status = 200;
-            ctx.type   = 'video/mp2t';
-            ctx.set('Cache-Control',     'no-cache, no-store, must-revalidate');
-            ctx.set('Connection',        'keep-alive');
-            ctx.set('X-Accel-Buffering', 'no');
-
-            const buffered = manager.buffer.getBufferedData();
-            if (buffered.length > 0) {
-                dbg(`sending ${buffered.length} buffered bytes`);
-                ctx.res.write(buffered);
-            }
-
-            const unsub = manager.addSubscriber(ctx);
-            ctx.req.on('close', unsub);
-            ctx.req.on('error', err => { dbg('subscriber error:', err.message); unsub(); });
-            ctx.body = new Promise(resolve => { ctx.req.on('close', resolve); ctx.req.on('error', resolve); });
+        // GET /live/health  →  quick JSON status
+        if (method === 'GET' && sub === '/health') {
+            ctx.type = 'application/json';
+            ctx.set('Cache-Control', 'no-cache');
+            ctx.body = JSON.stringify({ ok: true, rtmpPort, httpPort, streamKey });
             ctx.stop();
         }
     };
+
+    return {
+        unload() {
+            if (_nms) {
+                _nms.stop();
+                _nms = null;
+                api.log('[streaming] NMS stopped');
+            }
+        },
+    };
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Proxy NMS's HTTP-FLV response straight through to the HFS client.
+// ctx.body = the NMS response stream; Koa will pipe it.
+// ─────────────────────────────────────────────────────────────────────────────
+function proxyFlv(ctx, url) {
+    return new Promise(resolve => {
+        const req = http.get(url, res => {
+            ctx.status = res.statusCode || 200;
+            ctx.type   = 'video/x-flv';
+            ctx.set('Cache-Control',     'no-cache, no-store');
+            ctx.set('Connection',        'keep-alive');
+            ctx.set('X-Accel-Buffering', 'no');
+            ctx.set('Access-Control-Allow-Origin', '*');
+
+            ctx.body = res;                  // Koa pipes the stream
+            ctx.req.on('close', resolve);    // client disconnected
+            res.on('end', resolve);
+        });
+
+        req.on('error', () => {
+            ctx.status = 503;
+            ctx.type   = 'application/json';
+            ctx.body   = JSON.stringify({ error: 'Stream not available – is someone ingesting?' });
+            resolve();
+        });
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Build the viewer page.  mpegts.js decodes HTTP-FLV natively in the browser.
+// ─────────────────────────────────────────────────────────────────────────────
+function buildPlayerHtml(streamKey) {
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Stream</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #1a1a1a;
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            color: #fff;
+        }
+        .container { width: 90%; max-width: 1000px; }
+        video {
+            width: 100%;
+            background: #000;
+            border-radius: 4px;
+            display: block;
+        }
+        .info {
+            margin-top: 20px;
+            padding: 15px;
+            background: #222;
+            border-radius: 4px;
+        }
+        .info h2 { margin-bottom: 10px; font-size: 16px; }
+        .info p  { font-size: 13px; color: #aaa; margin: 5px 0; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <video id="player" controls muted></video>
+        <div class="info">
+            <h2>📺 Live Stream</h2>
+            <p id="status">Connecting…</p>
+            <p id="stream-url"></p>
+        </div>
+    </div>
+
+    <!-- mpegts.js: browser-side HTTP-FLV / MPEG-TS demuxer -->
+    <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1/dist/mpegts.min.js"></script>
+    <script>
+        const video     = document.getElementById('player');
+        const statusEl  = document.getElementById('status');
+        const urlEl     = document.getElementById('stream-url');
+
+        // Derive stream URL from current page location
+        const streamUrl = window.location.pathname.replace(/\\/$/, '') + '/stream';
+        urlEl.textContent = 'URL: ' + window.location.origin + streamUrl;
+
+        if (!mpegts.isSupported()) {
+            statusEl.textContent = '❌ mpegts.js is not supported in this browser.';
+        } else {
+            const player = mpegts.createPlayer({
+                type: 'flv',
+                isLive: true,
+                url:  streamUrl,
+            }, {
+                enableWorker:          true,
+                liveBufferLatencyChasing: true,
+                liveBufferLatencyMaxLatency: 1.5,
+                liveBufferLatencyMinRemain:  0.5,
+            });
+
+            player.attachMediaElement(video);
+            player.load();
+
+            player.on(mpegts.Events.ERROR, (type, detail) => {
+                statusEl.textContent = '❌ Error – ' + detail + ' (is someone streaming?)';
+            });
+
+            video.addEventListener('playing', () => { statusEl.textContent = '🔴 LIVE'; });
+            video.addEventListener('pause',   () => { statusEl.textContent = '⏸ PAUSED'; });
+            video.addEventListener('waiting', () => { statusEl.textContent = '⏳ Buffering…'; });
+
+            video.play().catch(() => {
+                // Autoplay blocked – user must click play
+                statusEl.textContent = '▶ Click play to start';
+            });
+        }
+    </script>
+</body>
+</html>`;
+}
