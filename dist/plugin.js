@@ -1,4 +1,4 @@
-exports.version = 0.7;
+exports.version = 0.8;
 exports.description = "RTMP Live Streaming - ingest via RTMP (OBS etc.), serve HTTP-FLV with HTML5 player";
 exports.apiRequired = 13;
 exports.repo = "feuerswut/hfs-streaming";
@@ -114,6 +114,9 @@ exports.init = api => {
 
     // Enforce stream key; debug-log accepted ingests
     _nms.on('prePublish', (id, streamPath /*, args */) => {
+        // Guard against empty/malformed stream paths from the RTMP handshake
+        if (typeof streamPath !== 'string') return;
+
         const incomingKey = streamPath.split('/').pop();
         if (incomingKey !== streamKey) {
             api.log(`[streaming] rejected publish: bad key "${incomingKey}"`);
@@ -197,7 +200,13 @@ function proxyFlv(ctx, url) {
             ctx.set('Access-Control-Allow-Origin','*');
 
             ctx.body = res;                  // Koa pipes the stream
-            ctx.req.on('close', resolve);    // client disconnected
+            
+            // Client disconnected (closed browser tab, etc.)
+            ctx.req.on('close', () => {
+                req.destroy();               // <--- CRITICAL: Kill the upstream NMS connection
+                resolve();
+            }); 
+            
             res.on('end', resolve);
         });
 
