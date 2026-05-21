@@ -1,4 +1,4 @@
-exports.version = 0.1;
+exports.version = 0.2;
 exports.description = "RTMP Live Streaming - ingest via RTMP (OBS etc.), serve HTTP-FLV with HTML5 player";
 exports.apiRequired = 13;
 exports.repo = "feuerswut/hfs-streaming";
@@ -54,14 +54,29 @@ function interceptConsole(api) {
     const origError = console.error;
     const origWarn  = console.warn;
 
+    let isIntercepting = false; // <-- The recursion guard
+
     const wrap = (orig, level) => (...args) => {
-        orig(...args);   // always keep original stdout output
+        // If we are already inside our own interception loop, just do normal logging
+        if (isIntercepting) {
+            return orig(...args);
+        }
+
+        isIntercepting = true;
         try {
+            orig(...args); // keep original stdout output
             const line = args.map(a =>
                 (typeof a === 'object' ? JSON.stringify(a) : String(a))
             ).join(' ');
+            
+            // This call to api.log will trigger console.log internally,
+            // but our flag will prevent the interceptor from catching it again.
             api.log(`[nms${level}] ${line}`);
-        } catch (_) { /* never let logging crash the plugin */ }
+        } catch (_) { 
+            /* never let logging crash the plugin */ 
+        } finally {
+            isIntercepting = false;
+        }
     };
 
     console.log   = wrap(origLog,   '');
