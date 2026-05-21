@@ -48,42 +48,54 @@
 </head>
 <body>
     <div class="container">
-        <video id="player" controls>
-            Your browser does not support MPEG-TS streams.
-        </video>
+        <video id="player" controls muted></video>
         <div class="info">
             <h2>📺 Live Stream</h2>
-            <p id="status">Loading stream URL...</p>
+            <p id="status">Connecting…</p>
+            <p id="stream-url"></p>
         </div>
     </div>
 
+    <!-- mpegts.js: browser-side HTTP-FLV / MPEG-TS demuxer -->
+    <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1/dist/mpegts.min.js"></script>
     <script>
-        const video = document.getElementById('player');
+        const video    = document.getElementById('player');
         const statusEl = document.getElementById('status');
-        
-        // Get stream URL from query param or construct it
-        const params = new URLSearchParams(window.location.search);
-        const streamUrl = params.get('stream') || window.location.pathname.replace(/\/$/, '') + '/stream';
-        
-        video.src = streamUrl;
-        statusEl.textContent = 'Stream: ' + streamUrl;
-        
-        video.addEventListener('play', function() {
-            statusEl.textContent = '🔴 LIVE';
-        });
-        
-        video.addEventListener('pause', function() {
-            statusEl.textContent = '⏸ PAUSED';
-        });
-        
-        video.addEventListener('error', function() {
-            statusEl.textContent = '❌ Error loading stream';
-        });
-        
-        // Auto play
-        video.play().catch(function(e) {
-            console.log('Autoplay blocked');
-        });
+        const urlEl    = document.getElementById('stream-url');
+
+        // Derive stream URL from current page location
+        const streamUrl = window.location.pathname.replace(/\/$/, '') + '/stream';
+        urlEl.textContent = 'URL: ' + window.location.origin + streamUrl;
+
+        if (!mpegts.isSupported()) {
+            statusEl.textContent = '❌ mpegts.js is not supported in this browser.';
+        } else {
+            const player = mpegts.createPlayer({
+                type: 'flv',
+                isLive: true,
+                url: streamUrl,
+            }, {
+                enableWorker: true,
+                liveBufferLatencyChasing: true,
+                liveBufferLatencyMaxLatency: 1.5,
+                liveBufferLatencyMinRemain: 0.5,
+            });
+
+            player.attachMediaElement(video);
+            player.load();
+
+            player.on(mpegts.Events.ERROR, (type, detail) => {
+                statusEl.textContent = '❌ Error – ' + detail + ' (is someone streaming?)';
+            });
+
+            video.addEventListener('playing', () => { statusEl.textContent = '🔴 LIVE'; });
+            video.addEventListener('pause',   () => { statusEl.textContent = '⏸ PAUSED'; });
+            video.addEventListener('waiting', () => { statusEl.textContent = '⏳ Buffering…'; });
+
+            video.play().catch(() => {
+                statusEl.textContent = '▶ Click play to start';
+            });
+        }
     </script>
 </body>
 </html>

@@ -1,4 +1,4 @@
-exports.version = 0.10;
+exports.version = 0.6;
 exports.description = "RTMP Live Streaming - ingest via RTMP (OBS etc.), serve HTTP-FLV with HTML5 player";
 exports.apiRequired = 13;
 exports.repo = "feuerswut/hfs-streaming";
@@ -20,33 +20,54 @@ exports.config = {
         type: 'boolean', defaultValue: true,
         helperText: "Cache last keyframe group so new viewers get a frame instantly", xs: 6,
     },
+    debug: {
+        type: 'boolean', defaultValue: false,
+        helperText: "Log ingest events (accepted / rejected publishes)", xs: 6,
+    },
 };
 
 exports.changelog = [
-    { version: 0.10, message: "Switched ingest to node-media-server (RTMP). HTTP-FLV output via mpegts.js player." },
+    { version: 0.6, message: "Switched ingest to node-media-server (RTMP). HTTP-FLV output via mpegts.js player." },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
 const http = require('http');
+const path = require('path');
+const fs   = require('fs');
 
-let _nms  = null;   // NodeMediaServer instance
-let _port = 8979;   // kept in sync so proxy always knows where NMS listens
+let _nms   = null;   // NodeMediaServer instance
+let _port  = 8979;   // kept in sync so proxy always knows where NMS listens
+let _debug = false;  // toggled from config
+
+function dbg(api, ...args) {
+    if (_debug) api.log('[streaming]', ...args);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 exports.init = api => {
 
     const NodeMediaServer = require('node-media-server');
 
-    const rtmpPort  = api.getConfig('rtmpPort')        || 1935;
-    const httpPort  = api.getConfig('internalHttpPort')|| 8979;
-    const streamKey = api.getConfig('streamKey')       || 'stream';
-    const gopCache  = api.getConfig('gopCache')        ?? true;
+    const rtmpPort  = api.getConfig('rtmpPort')         || 1935;
+    const httpPort  = api.getConfig('internalHttpPort') || 8979;
+    const streamKey = api.getConfig('streamKey')        || 'stream';
+    const gopCache  = api.getConfig('gopCache')         ?? true;
+    _debug          = api.getConfig('debug')            ?? false;
+    _port           = httpPort;
 
-    _port = httpPort;
+    // ── Load player.html from public/ ────────────────────────────────────────
+    const playerHtmlPath = path.join(__dirname, 'public', 'player.html');
+    let playerHtml = null;
+    try {
+        playerHtml = fs.readFileSync(playerHtmlPath, 'utf8');
+        api.log('[streaming] player.html loaded from public/player.html');
+    } catch (e) {
+        api.log('[streaming] WARNING: public/player.html not found – a notice will be served instead');
+    }
 
     // ── Start NMS ────────────────────────────────────────────────────────────
     _nms = new NodeMediaServer({
-        logType: 1,   // 1 = errors only; set 3 for verbose
+        logType: 1,   // 1 = errors only
         rtmp: {
             port:         rtmpPort,
             chunk_size:   60000,
@@ -60,38 +81,45 @@ exports.init = api => {
         },
     });
 
-    // Enforce stream key on every publish attempt
+    // Enforce stream key; debug-log accepted ingests
     _nms.on('prePublish', (id, streamPath /*, args */) => {
         const incomingKey = streamPath.split('/').pop();
         if (incomingKey !== streamKey) {
             api.log(`[streaming] rejected publish: bad key "${incomingKey}"`);
             const session = _nms.getSession(id);
             if (session) session.reject();
+        } else {
+            dbg(api, `ingest accepted – stream path: ${streamPath}`);
         }
+    });
+
+    _nms.on('postPublish', (id, streamPath /*, args */) => {
+        dbg(api, `ingest live (postPublish) – stream path: ${streamPath}`);
+    });
+
+    _nms.on('donePublish', (id, streamPath /*, args */) => {
+        dbg(api, `ingest ended (donePublish) – stream path: ${streamPath}`);
     });
 
     _nms.run();
     api.log(`[streaming] RTMP listening on :${rtmpPort}  |  NMS HTTP on :${httpPort}`);
     api.log(`[streaming] OBS → rtmp://THIS_SERVER:${rtmpPort}/live/${streamKey}`);
 
-    // ── Player HTML (inlined – no public/ file needed) ───────────────────────
-    const playerHtml = buildPlayerHtml(streamKey);
-
     // ── HFS middleware ────────────────────────────────────────────────────────
     exports.middleware = async ctx => {
 
-        // Match any path that contains /live (works behind reverse-proxies)
+        // Match any path containing /live (works behind reverse-proxies)
         const liveIdx = ctx.path.indexOf('/live');
         if (liveIdx === -1) return;
 
         const sub    = ctx.path.slice(liveIdx + 5);  // e.g. "" | "/stream"
         const method = ctx.method.toUpperCase();
 
-        // GET /live  →  player page
+        // GET /live  →  player page (or missing-file notice)
         if (method === 'GET' && (sub === '' || sub === '/')) {
             ctx.status = 200;
             ctx.type   = 'text/html';
-            ctx.body   = playerHtml;
+            ctx.body   = playerHtml !== null ? playerHtml : missingPlayerHtml();
             ctx.stop();
             return;
         }
@@ -126,17 +154,16 @@ exports.init = api => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Proxy NMS's HTTP-FLV response straight through to the HFS client.
-// ctx.body = the NMS response stream; Koa will pipe it.
 // ─────────────────────────────────────────────────────────────────────────────
 function proxyFlv(ctx, url) {
     return new Promise(resolve => {
         const req = http.get(url, res => {
             ctx.status = res.statusCode || 200;
             ctx.type   = 'video/x-flv';
-            ctx.set('Cache-Control',     'no-cache, no-store');
-            ctx.set('Connection',        'keep-alive');
-            ctx.set('X-Accel-Buffering', 'no');
-            ctx.set('Access-Control-Allow-Origin', '*');
+            ctx.set('Cache-Control',              'no-cache, no-store');
+            ctx.set('Connection',                 'keep-alive');
+            ctx.set('X-Accel-Buffering',          'no');
+            ctx.set('Access-Control-Allow-Origin','*');
 
             ctx.body = res;                  // Koa pipes the stream
             ctx.req.on('close', resolve);    // client disconnected
@@ -153,95 +180,30 @@ function proxyFlv(ctx, url) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Build the viewer page.  mpegts.js decodes HTTP-FLV natively in the browser.
+// Served when public/player.html is absent.
 // ─────────────────────────────────────────────────────────────────────────────
-function buildPlayerHtml(streamKey) {
+function missingPlayerHtml() {
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Live Stream</title>
+    <title>Player missing</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            background: #1a1a1a;
-            font-family: Arial, sans-serif;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            color: #fff;
-        }
-        .container { width: 90%; max-width: 1000px; }
-        video {
-            width: 100%;
-            background: #000;
-            border-radius: 4px;
-            display: block;
-        }
-        .info {
-            margin-top: 20px;
-            padding: 15px;
-            background: #222;
-            border-radius: 4px;
-        }
-        .info h2 { margin-bottom: 10px; font-size: 16px; }
-        .info p  { font-size: 13px; color: #aaa; margin: 5px 0; }
+        body { background:#1a1a1a; color:#e0e0e0; font-family:Arial,sans-serif;
+               display:flex; justify-content:center; align-items:center; min-height:100vh; }
+        .box { max-width:480px; padding:2rem; background:#222; border-radius:6px; text-align:center; }
+        h2   { margin-bottom:1rem; color:#f08030; }
+        code { background:#333; padding:2px 6px; border-radius:3px; font-size:0.9em; }
+        p    { margin:0.6rem 0; line-height:1.5; color:#aaa; font-size:0.9em; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <video id="player" controls muted></video>
-        <div class="info">
-            <h2>📺 Live Stream</h2>
-            <p id="status">Connecting…</p>
-            <p id="stream-url"></p>
-        </div>
+    <div class="box">
+        <h2>⚠️ Player not found</h2>
+        <p><code>public/player.html</code> is missing from the plugin folder.</p>
+        <p>Create that file to serve your custom player here.<br>
+           The stream itself is still available at <code>/live/stream</code>.</p>
     </div>
-
-    <!-- mpegts.js: browser-side HTTP-FLV / MPEG-TS demuxer -->
-    <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1/dist/mpegts.min.js"></script>
-    <script>
-        const video     = document.getElementById('player');
-        const statusEl  = document.getElementById('status');
-        const urlEl     = document.getElementById('stream-url');
-
-        // Derive stream URL from current page location
-        const streamUrl = window.location.pathname.replace(/\\/$/, '') + '/stream';
-        urlEl.textContent = 'URL: ' + window.location.origin + streamUrl;
-
-        if (!mpegts.isSupported()) {
-            statusEl.textContent = '❌ mpegts.js is not supported in this browser.';
-        } else {
-            const player = mpegts.createPlayer({
-                type: 'flv',
-                isLive: true,
-                url:  streamUrl,
-            }, {
-                enableWorker:          true,
-                liveBufferLatencyChasing: true,
-                liveBufferLatencyMaxLatency: 1.5,
-                liveBufferLatencyMinRemain:  0.5,
-            });
-
-            player.attachMediaElement(video);
-            player.load();
-
-            player.on(mpegts.Events.ERROR, (type, detail) => {
-                statusEl.textContent = '❌ Error – ' + detail + ' (is someone streaming?)';
-            });
-
-            video.addEventListener('playing', () => { statusEl.textContent = '🔴 LIVE'; });
-            video.addEventListener('pause',   () => { statusEl.textContent = '⏸ PAUSED'; });
-            video.addEventListener('waiting', () => { statusEl.textContent = '⏳ Buffering…'; });
-
-            video.play().catch(() => {
-                // Autoplay blocked – user must click play
-                statusEl.textContent = '▶ Click play to start';
-            });
-        }
-    </script>
 </body>
 </html>`;
 }
