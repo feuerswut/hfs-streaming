@@ -25,7 +25,7 @@ In HFS admin panel:
 **From OBS:**
 1. Open OBS
 2. Settings → Output
-3. Set server to: `http://localhost:3000/live/ingest`
+3. Set server to: `http://localhost:3000/live/ingest` (use your appropriate server url and port)
 4. Click "Start Streaming"
 
 **From FFmpeg (command line):**
