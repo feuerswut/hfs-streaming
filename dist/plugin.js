@@ -128,33 +128,39 @@ exports.init = api => {
     });
 
     // Enforce stream key; debug-log accepted ingests
-    _nms.on('prePublish', (session, streamPath) => {
-        // Fallback for NMS v4 where streamPath might be inside the session object
-        const path = streamPath || session.publishStreamPath || '';
+    _nms.on('prePublish', (idOrSession, streamPath) => {
+        // Bulletproof check: grab the session whether NMS passed an ID or the object itself
+        const session = typeof idOrSession === 'string' ? _nms.getSession(idOrSession) : idOrSession;
+        const path = streamPath || (session && session.publishStreamPath) || '';
+        
         if (!path) return;
 
         const incomingKey = path.split('/').pop();
         if (incomingKey !== streamKey) {
             api.log(`[streaming] rejected publish: bad key "${incomingKey}"`);
-            if (typeof session.reject === 'function') session.reject();
+            if (session && typeof session.reject === 'function') {
+                session.reject(); // Safely disconnect unauthorized users
+            }
         } else {
             dbg(api, `ingest accepted – stream path: ${path}`);
         }
     });
 
-    _nms.on('postPublish', (session, streamPath) => {
-        const path = streamPath || session.publishStreamPath || '';
+    _nms.on('postPublish', (idOrSession, streamPath) => {
+        const session = typeof idOrSession === 'string' ? _nms.getSession(idOrSession) : idOrSession;
+        const path = streamPath || (session && session.publishStreamPath) || '';
         dbg(api, `ingest live (postPublish) – stream path: ${path}`);
     });
 
-    _nms.on('donePublish', (session, streamPath) => {
-        const path = streamPath || session.publishStreamPath || '';
+    _nms.on('donePublish', (idOrSession, streamPath) => {
+        const session = typeof idOrSession === 'string' ? _nms.getSession(idOrSession) : idOrSession;
+        const path = streamPath || (session && session.publishStreamPath) || '';
         dbg(api, `ingest ended (donePublish) – stream path: ${path}`);
     });
 
     _nms.run();
     api.log(`[streaming] RTMP listening on :${rtmpPort}  |  NMS HTTP on :${httpPort}`);
-    api.log(`[streaming] OBS → rtmp://THIS_SERVER:${rtmpPort}/live/${streamKey}`);
+    api.log(`[streaming] OBS → rtmp://THIS_SERVER:${rtmpPort}/live (Key: ${streamKey})`);
 
     // ── HFS middleware ────────────────────────────────────────────────────────
     exports.middleware = async ctx => {
