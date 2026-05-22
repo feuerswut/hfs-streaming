@@ -1,4 +1,4 @@
-exports.version = 0.4;
+exports.version = 0.1;
 exports.description = "RTMP Live Streaming - ingest via RTMP (OBS etc.), serve HTTP-FLV with HTML5 player";
 exports.apiRequired = 13;
 exports.repo = "feuerswut/hfs-streaming";
@@ -203,20 +203,19 @@ exports.init = api => {
             if (_nms) {
                 _nms.stop();
                 _nms = null;
-                api.log('[streaming] NMS stopped');
             }
             
-            // 1. Force-kill all active HTTP proxy connections to NMS
-            for (const req of _activeProxies) {
-                req.destroy();
+            // Clear the node-media-server module from memory
+            try {
+                const nmsPath = require.resolve('node-media-server');
+                delete require.cache[nmsPath];
+            } catch (e) {
+                // Module might already be gone
             }
-            _activeProxies.clear();
-            
-            // 2. Restore the original console behavior
-            if (_restoreConsole) {
-                _restoreConsole();
-                _restoreConsole = null;
-            }
+
+            // Restore console and clear proxies as before...
+            if (_restoreConsole) _restoreConsole();
+            for (const req of _activeProxies) req.destroy();
         },
     };
 };
@@ -227,38 +226,41 @@ exports.init = api => {
 function proxyFlv(ctx, url) {
     return new Promise(resolve => {
         const req = http.get(url, res => {
-            ctx.status = res.statusCode || 200;
-            ctx.type   = 'video/x-flv';
-            ctx.set('Cache-Control',              'no-cache, no-store');
-            ctx.set('Connection',                 'keep-alive');
-            ctx.set('X-Accel-Buffering',          'no');
-            ctx.set('Access-Control-Allow-Origin','*');
+            // 1. Set status code manually
+            ctx.res.statusCode = res.statusCode || 200;
 
-            // Pass the NMS video stream to HFS
-            ctx.body = res;                  
+            // 2. Set headers manually on the raw response object
+            ctx.res.setHeader('Content-Type', 'video/x-flv');
+            ctx.res.setHeader('Cache-Control', 'no-cache, no-store');
+            ctx.res.setHeader('Connection', 'keep-alive');
+            ctx.res.setHeader('X-Accel-Buffering', 'no');
+            ctx.res.setHeader('Access-Control-Allow-Origin', '*');
+
+            // 3. Pipe the raw NMS stream directly to the client
+            res.pipe(ctx.res);
+
+            // 4. Important: Tell HFS you have handled the response
+            // This prevents HFS from trying to process ctx.body later
+            ctx.res.finished = true; 
             
-            // CRITICAL FIX: Resolve immediately so Koa starts sending video to the player!
-            resolve(); 
-            
-            // Clean up when the viewer closes the browser tab
+            resolve();
+
+            // Cleanup
             ctx.req.on('close', () => {
-                req.destroy();               
-                _activeProxies.delete(req); 
-            }); 
-            
-            // Clean up if the stream stops
-            res.on('end', () => {
-                _activeProxies.delete(req); 
+                req.destroy();
+                _activeProxies.delete(req);
             });
         });
 
-        _activeProxies.add(req); 
+        _activeProxies.add(req);
 
-        req.on('error', () => {
-            _activeProxies.delete(req); 
-            ctx.status = 503;
-            ctx.type   = 'application/json';
-            ctx.body   = JSON.stringify({ error: 'Stream not available – is someone ingesting?' });
+        req.on('error', (err) => {
+            _activeProxies.delete(req);
+            // If headers weren't sent, we can safely send an error
+            if (!ctx.res.headersSent) {
+                ctx.res.writeHead(503, { 'Content-Type': 'application/json' });
+                ctx.res.end(JSON.stringify({ error: 'Stream unavailable' }));
+            }
             resolve();
         });
     });
