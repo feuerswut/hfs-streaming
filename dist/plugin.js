@@ -1,4 +1,4 @@
-exports.version = 0.3;
+exports.version = 0.4;
 exports.description = "RTMP Live Streaming - ingest via RTMP (OBS etc.), serve HTTP-FLV with HTML5 player";
 exports.apiRequired = 13;
 exports.repo = "feuerswut/hfs-streaming";
@@ -234,25 +234,28 @@ function proxyFlv(ctx, url) {
             ctx.set('X-Accel-Buffering',          'no');
             ctx.set('Access-Control-Allow-Origin','*');
 
+            // Pass the NMS video stream to HFS
             ctx.body = res;                  
             
-            // Client disconnected (closed browser tab, etc.)
+            // CRITICAL FIX: Resolve immediately so Koa starts sending video to the player!
+            resolve(); 
+            
+            // Clean up when the viewer closes the browser tab
             ctx.req.on('close', () => {
                 req.destroy();               
-                _activeProxies.delete(req); // <-- Clean up on client disconnect
-                resolve();
+                _activeProxies.delete(req); 
             }); 
             
+            // Clean up if the stream stops
             res.on('end', () => {
-                _activeProxies.delete(req); // <-- Clean up on stream end
-                resolve();
+                _activeProxies.delete(req); 
             });
         });
 
-        _activeProxies.add(req); // <-- Track the request immediately
+        _activeProxies.add(req); 
 
         req.on('error', () => {
-            _activeProxies.delete(req); // <-- Clean up on error
+            _activeProxies.delete(req); 
             ctx.status = 503;
             ctx.type   = 'application/json';
             ctx.body   = JSON.stringify({ error: 'Stream not available – is someone ingesting?' });
