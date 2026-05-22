@@ -119,7 +119,7 @@
 <body>
 <div class="player-wrap">
     <div class="video-shell">
-        <video id="video" playsinline muted></video>
+        <video id="video" playsinline muted autoplay></video>
         <div class="overlay" id="overlay">
             <div class="overlay-icon" id="overlay-icon">📡</div>
             <div class="overlay-title" id="overlay-title">Waiting for stream…</div>
@@ -254,8 +254,13 @@ function connect() {
 
     player.load();
     video.play().catch(() => {
-        // Autoplay blocked — user needs to click play; that's fine
-        setStatus('', '▶ Click play to start');
+        setStatus('', '▶ Click to play');
+        showOverlay('▶', 'Click to play', 'Autoplay was blocked by the browser');
+        overlay.style.cursor = 'pointer';
+        overlay.addEventListener('click', () => {
+            overlay.style.cursor = '';
+            video.play().catch(() => {});
+        }, { once: true });
     });
 }
 

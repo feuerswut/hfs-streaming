@@ -323,6 +323,10 @@ function serveFLV(ctx, broadcast, api) {
             'Access-Control-Allow-Origin': '*',
         });
 
+        // koa-session (and other outer middleware) will try to call setHeader()
+        // after we've already sent headers — silence those attempts so they don't crash.
+        ctx.res.setHeader = () => {};
+
         // postPlay() synchronously writes the FLV header + any cached GOP frames
         // to our subscriber (via sendBuffer above), then adds us to subscribers map.
         const err = broadcast.postPlay(subscriber);
