@@ -1,4 +1,4 @@
-exports.version = 0.2;
+exports.version = 0.3;
 exports.description = "RTMP Live Streaming - ingest via RTMP (OBS etc.), serve HTTP-FLV with HTML5 player";
 exports.apiRequired = 13;
 exports.repo = "feuerswut/hfs-streaming";
@@ -54,28 +54,26 @@ function interceptConsole(api) {
     const origError = console.error;
     const origWarn  = console.warn;
 
-    let isIntercepting = false; // <-- The recursion guard
+    let isIntercepting = false;
 
     const wrap = (orig, level) => (...args) => {
-        // If we are already inside our own interception loop, just do normal logging
-        if (isIntercepting) {
-            return orig(...args);
-        }
+        orig(...args); // Always output to the real terminal
+        
+        if (isIntercepting) return;
 
-        isIntercepting = true;
-        try {
-            orig(...args); // keep original stdout output
-            const line = args.map(a =>
-                (typeof a === 'object' ? JSON.stringify(a) : String(a))
-            ).join(' ');
-            
-            // This call to api.log will trigger console.log internally,
-            // but our flag will prevent the interceptor from catching it again.
-            api.log(`[nms${level}] ${line}`);
-        } catch (_) { 
-            /* never let logging crash the plugin */ 
-        } finally {
-            isIntercepting = false;
+        const line = args.map(a =>
+            (typeof a === 'object' ? JSON.stringify(a) : String(a))
+        ).join(' ');
+
+        // ONLY intercept lines that start with the NMS date format: [DD/MM/YYYY
+        if (/^\[\d{2}\/\d{2}\/\d{4}/.test(line)) {
+            isIntercepting = true;
+            try {
+                api.log(`[nms${level}] ${line}`);
+            } catch (_) { 
+            } finally {
+                isIntercepting = false;
+            }
         }
     };
 
@@ -130,26 +128,28 @@ exports.init = api => {
     });
 
     // Enforce stream key; debug-log accepted ingests
-    _nms.on('prePublish', (id, streamPath /*, args */) => {
-        // Guard against empty/malformed stream paths from the RTMP handshake
-        if (typeof streamPath !== 'string') return;
+    _nms.on('prePublish', (session, streamPath) => {
+        // Fallback for NMS v4 where streamPath might be inside the session object
+        const path = streamPath || session.publishStreamPath || '';
+        if (!path) return;
 
-        const incomingKey = streamPath.split('/').pop();
+        const incomingKey = path.split('/').pop();
         if (incomingKey !== streamKey) {
             api.log(`[streaming] rejected publish: bad key "${incomingKey}"`);
-            const session = _nms.getSession(id);
-            if (session) session.reject();
+            if (typeof session.reject === 'function') session.reject();
         } else {
-            dbg(api, `ingest accepted – stream path: ${streamPath}`);
+            dbg(api, `ingest accepted – stream path: ${path}`);
         }
     });
 
-    _nms.on('postPublish', (id, streamPath /*, args */) => {
-        dbg(api, `ingest live (postPublish) – stream path: ${streamPath}`);
+    _nms.on('postPublish', (session, streamPath) => {
+        const path = streamPath || session.publishStreamPath || '';
+        dbg(api, `ingest live (postPublish) – stream path: ${path}`);
     });
 
-    _nms.on('donePublish', (id, streamPath /*, args */) => {
-        dbg(api, `ingest ended (donePublish) – stream path: ${streamPath}`);
+    _nms.on('donePublish', (session, streamPath) => {
+        const path = streamPath || session.publishStreamPath || '';
+        dbg(api, `ingest ended (donePublish) – stream path: ${path}`);
     });
 
     _nms.run();
