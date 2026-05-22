@@ -1,4 +1,4 @@
-exports.version = 0.9;
+exports.version = 0.11;
 exports.description = "RTMP Live Streaming — ingest via RTMP (OBS / ffmpeg), serve HTTP-FLV with HTML5 player";
 exports.apiRequired = 13;
 exports.repo = "feuerswut/hfs-streaming";
@@ -21,6 +21,18 @@ exports.config = {
         options: { 'Error (default)': 'error', 'Warn': 'warn', 'Info': 'info', 'Debug': 'debug', 'Trace': 'trace' },
         helperText: "Node-Media-Server internal log verbosity. Lines are captured to the HFS console.",
     },
+    rtspEnabled: {
+        type: 'boolean', defaultValue: false, label: 'RTSP Output (requires ffmpeg)',
+        helperText: 'Re-serve the stream as RTSP on the port below. Requires ffmpeg to be installed.',
+    },
+    ffmpegPath: {
+        type: 'string', defaultValue: '/usr/bin/ffmpeg', label: 'ffmpeg Path',
+        helperText: 'Full path to the ffmpeg binary, e.g. /usr/bin/ffmpeg',
+    },
+    rtspPort: {
+        type: 'number', defaultValue: 554, label: 'RTSP Port',
+        helperText: 'Port to serve the RTSP stream on. Default is 554 (requires root) or use 8554.',
+    },
     debug: {
         type: 'boolean', defaultValue: false, label: 'Plugin Debug Logging',
         helperText: "Log plugin-level events (connects, disconnects, key checks) to the HFS console.",
@@ -28,12 +40,15 @@ exports.config = {
 };
 
 exports.changelog = [
-    { "version": 0.9, "message": "First WORKING version. Only use NMS code, dont run an instance of it." },
+    { "version": 0.12, "message": "Add optional RTSP output via ffmpeg (VRChat / AVPro support)." },
+    { "version": 0.11, "message": "Fix ERR_HTTP_HEADERS_SENT crash from koa-session running after FLV writeHead." },
+    { "version": 0.9,  "message": "First WORKING version. Only use NMS code, dont run an instance of it." },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
-const path = require('path');
-const fs   = require('fs');
+const path           = require('path');
+const fs             = require('fs');
+const { spawn }      = require('child_process');
 
 // NMS sub-module paths — resolved relative to this plugin's node_modules.
 // We deliberately do NOT require the top-level 'node-media-server' package
@@ -119,6 +134,11 @@ exports.init = api => {
     const nmsLogLevel = api.getConfig('nmsLogLevel') || 'error';
     _debug            = api.getConfig('debug')       ?? false;
 
+    const rtspEnabled = api.getConfig('rtspEnabled') ?? false;
+    const ffmpegPath  = api.getConfig('ffmpegPath')  || '/usr/bin/ffmpeg';
+    const rtspPort    = api.getConfig('rtspPort')    || 554;
+    let _ffmpeg       = null;
+
     // ── Console intercept for NMS logs ────────────────────────────────────────
     _restoreConsole = interceptConsole(api);
 
@@ -136,6 +156,41 @@ exports.init = api => {
     _rtmpServer.run();
     api.log(`[streaming] RTMP listening on :${rtmpPort}`);
     api.log(`[streaming] OBS → rtmp://THIS_SERVER:${rtmpPort}/${streamApp}   Key: ${streamKey}`);
+    if (rtspEnabled) {
+        api.log(`[streaming] RTSP enabled — will serve on :${rtspPort} once stream starts`);
+        api.log(`[streaming] VRChat / AVPro → rtsp://THIS_SERVER:${rtspPort}/${streamApp}/${streamKey}`);
+    }
+
+    // ── RTSP via ffmpeg ───────────────────────────────────────────────────────
+    function startRtsp() {
+        if (!rtspEnabled || _ffmpeg) return;
+        const rtmpUrl = `rtmp://localhost:${rtmpPort}/${streamApp}/${streamKey}`;
+        const rtspUrl = `rtsp://0.0.0.0:${rtspPort}/${streamApp}/${streamKey}`;
+        _ffmpeg = spawn(ffmpegPath, [
+            '-i',          rtmpUrl,
+            '-c',          'copy',
+            '-f',          'rtsp',
+            '-rtsp_flags', 'listen',
+            rtspUrl,
+        ]);
+        _ffmpeg.stderr.on('data', d => dbg(api, '[ffmpeg]', d.toString().trimEnd()));
+        _ffmpeg.on('close', code => {
+            dbg(api, `ffmpeg exited (${code})`);
+            _ffmpeg = null;
+        });
+        _ffmpeg.on('error', err => {
+            api.log(`[streaming] ffmpeg error: ${err.message} — is ffmpegPath correct?`);
+            _ffmpeg = null;
+        });
+        api.log(`[streaming] RTSP ffmpeg started → rtsp://THIS_SERVER:${rtspPort}/${streamApp}/${streamKey}`);
+    }
+
+    function stopRtsp() {
+        if (!_ffmpeg) return;
+        _ffmpeg.kill('SIGTERM');
+        _ffmpeg = null;
+        dbg(api, 'RTSP ffmpeg stopped');
+    }
 
     // ── NMS event handlers (NMS 4.x always passes the session object) ─────────
     Context.eventEmitter.on('prePublish', session => {
@@ -151,10 +206,12 @@ exports.init = api => {
 
     Context.eventEmitter.on('postPublish', session => {
         dbg(api, `ingest live – ${session.streamPath}`);
+        startRtsp();
     });
 
     Context.eventEmitter.on('donePublish', session => {
         dbg(api, `ingest ended – ${session.streamPath}`);
+        stopRtsp();
     });
 
     // ── Load & prepare player.html ────────────────────────────────────────────
@@ -219,7 +276,10 @@ exports.init = api => {
             const live         = !!(broadcast && broadcast.publisher);
             ctx.type           = 'application/json';
             ctx.set('Cache-Control', 'no-cache');
-            ctx.body = JSON.stringify({ ok: true, live, rtmpPort, streamApp, streamKey });
+            ctx.body = JSON.stringify({
+                ok: true, live, rtmpPort, streamApp, streamKey,
+                rtsp: rtspEnabled ? { port: rtspPort, url: `rtsp://THIS_SERVER:${rtspPort}/${streamApp}/${streamKey}` } : false,
+            });
             ctx.stop();
         }
     };
@@ -227,6 +287,9 @@ exports.init = api => {
     // ── Unload / cleanup ──────────────────────────────────────────────────────
     return {
         unload() {
+            // 0. Stop ffmpeg RTSP relay if running.
+            stopRtsp();
+
             // 1. Remove all event listeners we registered so they don't fire
             //    on a stale api object after reload.
             Context.eventEmitter.removeAllListeners('prePublish');
@@ -244,10 +307,10 @@ exports.init = api => {
             //    closeAllConnections() (Node 18.2+) immediately destroys open
             //    sockets so the port is released without waiting for keep-alive.
             if (_rtmpServer) {
-                try { _rtmpServer.tcpServer?.close(); }           catch (_) {}
-                try { _rtmpServer.tcpServer?.closeAllConnections?.(); } catch (_) {}
-                try { _rtmpServer.tlsServer?.close(); }           catch (_) {}
-                try { _rtmpServer.tlsServer?.closeAllConnections?.(); } catch (_) {}
+                try { _rtmpServer.tcpServer?.close(); }                   catch (_) {}
+                try { _rtmpServer.tcpServer?.closeAllConnections?.(); }   catch (_) {}
+                try { _rtmpServer.tlsServer?.close(); }                   catch (_) {}
+                try { _rtmpServer.tlsServer?.closeAllConnections?.(); }   catch (_) {}
                 _rtmpServer = null;
             }
 
@@ -315,11 +378,11 @@ function serveFLV(ctx, broadcast, api) {
         // Take over the response — Koa must not try to finalise it after us.
         ctx.respond = false;
         ctx.res.writeHead(200, {
-            'Content-Type':            'video/x-flv',
-            'Cache-Control':           'no-cache, no-store',
-            'Connection':              'keep-alive',
-            'Transfer-Encoding':       'chunked',
-            'X-Accel-Buffering':       'no',
+            'Content-Type':                'video/x-flv',
+            'Cache-Control':               'no-cache, no-store',
+            'Connection':                  'keep-alive',
+            'Transfer-Encoding':           'chunked',
+            'X-Accel-Buffering':           'no',
             'Access-Control-Allow-Origin': '*',
         });
 
