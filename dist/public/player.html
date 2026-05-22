@@ -5,97 +5,313 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Live Stream</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
         body {
-            background: #1a1a1a;
-            font-family: Arial, sans-serif;
+            background: #111;
+            color: #e0e0e0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
             display: flex;
-            justify-content: center;
+            flex-direction: column;
             align-items: center;
+            justify-content: center;
             min-height: 100vh;
-            color: #fff;
+            padding: 16px;
         }
-        .container {
-            width: 90%;
-            max-width: 1000px;
+
+        .player-wrap {
+            width: 100%;
+            max-width: 1100px;
         }
+
+        .video-shell {
+            position: relative;
+            background: #000;
+            border-radius: 6px;
+            overflow: hidden;
+            aspect-ratio: 16 / 9;
+        }
+
         video {
             width: 100%;
-            background: #000;
-            border-radius: 4px;
+            height: 100%;
             display: block;
+            object-fit: contain;
         }
-        .info {
-            margin-top: 20px;
-            padding: 15px;
-            background: #222;
+
+        /* Overlay shown when stream is offline / errored */
+        .overlay {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0,0,0,0.82);
+            gap: 12px;
+            transition: opacity 0.3s;
+        }
+        .overlay.hidden { opacity: 0; pointer-events: none; }
+
+        .overlay-icon { font-size: 3rem; }
+        .overlay-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #fff;
+        }
+        .overlay-sub {
+            font-size: 0.82rem;
+            color: #888;
+        }
+
+        /* Status bar */
+        .status-bar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 12px;
+            padding: 10px 14px;
+            background: #1a1a1a;
+            border-radius: 6px;
+            font-size: 0.82rem;
+        }
+
+        .dot {
+            width: 9px; height: 9px;
+            border-radius: 50%;
+            flex-shrink: 0;
+            background: #555;
+            transition: background 0.3s;
+        }
+        .dot.live    { background: #e53935; animation: pulse 1.4s infinite; }
+        .dot.waiting { background: #f59e0b; }
+        .dot.error   { background: #ef4444; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50%       { opacity: 0.35; }
+        }
+
+        #status-text { flex: 1; color: #ccc; }
+
+        .stream-url {
+            color: #555;
+            font-family: monospace;
+            font-size: 0.75rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 340px;
+        }
+
+        /* Retry counter badge */
+        .retry-badge {
+            background: #2a2a2a;
             border-radius: 4px;
+            padding: 2px 7px;
+            color: #777;
+            font-size: 0.75rem;
+            display: none;
         }
-        .info h2 {
-            margin-bottom: 10px;
-            font-size: 16px;
-        }
-        .info p {
-            font-size: 13px;
-            color: #aaa;
-            margin: 5px 0;
-        }
+        .retry-badge.visible { display: inline-block; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <video id="player" controls muted></video>
-        <div class="info">
-            <h2>📺 Live Stream</h2>
-            <p id="status">Connecting…</p>
-            <p id="stream-url"></p>
+<div class="player-wrap">
+    <div class="video-shell">
+        <video id="video" playsinline muted></video>
+        <div class="overlay" id="overlay">
+            <div class="overlay-icon" id="overlay-icon">📡</div>
+            <div class="overlay-title" id="overlay-title">Waiting for stream…</div>
+            <div class="overlay-sub"  id="overlay-sub">Start streaming in OBS to begin</div>
         </div>
     </div>
+    <div class="status-bar">
+        <div class="dot" id="dot"></div>
+        <span id="status-text">Connecting…</span>
+        <span class="retry-badge" id="retry-badge"></span>
+        <span class="stream-url" id="stream-url"></span>
+    </div>
+</div>
 
-    <!-- mpegts.js: browser-side HTTP-FLV / MPEG-TS demuxer -->
-    <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1/dist/mpegts.min.js"></script>
-    <script>
-        const video    = document.getElementById('player');
-        const statusEl = document.getElementById('status');
-        const urlEl    = document.getElementById('stream-url');
+<script src="https://cdn.jsdelivr.net/npm/mpegts.js@1/dist/mpegts.min.js"></script>
+<script>
+// ── Config injected by plugin at serve-time ──────────────────────────────────
+// These placeholders are replaced by plugin.js before the HTML is sent.
+const STREAM_FLV_PATH = '{{STREAM_FLV_PATH}}';   // e.g. /live/stream.flv
+const STREAM_APP      = '{{STREAM_APP}}';          // e.g. live
+const STREAM_KEY      = '{{STREAM_KEY}}';          // e.g. stream
 
-        // Derive stream URL from current page location
-        const streamUrl = window.location.pathname.replace(/\/$/, '') + '/stream';
-        urlEl.textContent = 'URL: ' + window.location.origin + streamUrl;
+// ── DOM refs ──────────────────────────────────────────────────────────────────
+const video      = document.getElementById('video');
+const overlay    = document.getElementById('overlay');
+const overlayIcon  = document.getElementById('overlay-icon');
+const overlayTitle = document.getElementById('overlay-title');
+const overlaySub   = document.getElementById('overlay-sub');
+const dot          = document.getElementById('dot');
+const statusText   = document.getElementById('status-text');
+const retryBadge   = document.getElementById('retry-badge');
+const streamUrlEl  = document.getElementById('stream-url');
 
-        if (!mpegts.isSupported()) {
-            statusEl.textContent = '❌ mpegts.js is not supported in this browser.';
-        } else {
-            const player = mpegts.createPlayer({
-                type: 'flv',
-                isLive: true,
-                url: streamUrl,
-            }, {
-                enableWorker: true,
-                liveBufferLatencyChasing: true,
-                liveBufferLatencyMaxLatency: 1.5,
-                liveBufferLatencyMinRemain: 0.5,
-            });
+// Build the absolute stream URL from the injected path
+const streamUrl = window.location.origin + STREAM_FLV_PATH;
+streamUrlEl.textContent = streamUrl;
 
-            player.attachMediaElement(video);
-            player.load();
+// ── State ─────────────────────────────────────────────────────────────────────
+let player       = null;
+let retryCount   = 0;
+let retryTimer   = null;
+let destroyed    = false;
+const MAX_DELAY  = 16000;   // cap retry back-off at 16 s
 
-            player.on(mpegts.Events.ERROR, (type, detail) => {
-                statusEl.textContent = '❌ Error – ' + detail + ' (is someone streaming?)';
-            });
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function setStatus(state, text, sub) {
+    dot.className = 'dot ' + state;          // 'live' | 'waiting' | 'error' | ''
+    statusText.textContent = text;
+    if (sub !== undefined) overlaySub.textContent = sub;
+}
 
-            video.addEventListener('playing', () => { statusEl.textContent = '🔴 LIVE'; });
-            video.addEventListener('pause',   () => { statusEl.textContent = '⏸ PAUSED'; });
-            video.addEventListener('waiting', () => { statusEl.textContent = '⏳ Buffering…'; });
+function showOverlay(icon, title, sub) {
+    overlayIcon.textContent  = icon;
+    overlayTitle.textContent = title;
+    if (sub !== undefined) overlaySub.textContent = sub;
+    overlay.classList.remove('hidden');
+}
 
-            video.play().catch(() => {
-                statusEl.textContent = '▶ Click play to start';
-            });
+function hideOverlay() {
+    overlay.classList.add('hidden');
+}
+
+function setRetry(n) {
+    if (n > 0) {
+        retryBadge.textContent = `retry #${n}`;
+        retryBadge.classList.add('visible');
+    } else {
+        retryBadge.classList.remove('visible');
+    }
+}
+
+// ── mpegts player lifecycle ───────────────────────────────────────────────────
+function destroyPlayer() {
+    if (!player) return;
+    try {
+        player.pause();
+        player.unload();
+        player.detachMediaElement();
+        player.destroy();
+    } catch (_) {}
+    player = null;
+}
+
+function connect() {
+    if (destroyed) return;
+    destroyPlayer();
+
+    if (!mpegts.isSupported()) {
+        showOverlay('❌', 'Browser not supported', 'mpegts.js requires MSE — try Chrome or Edge.');
+        setStatus('error', 'Unsupported browser');
+        return;
+    }
+
+    setStatus('waiting', retryCount === 0 ? 'Connecting…' : `Reconnecting… (attempt ${retryCount})`);
+    setRetry(retryCount);
+
+    player = mpegts.createPlayer(
+        {
+            type:   'flv',
+            isLive: true,
+            url:    streamUrl,
+        },
+        {
+            enableWorker:                 true,
+            liveBufferLatencyChasing:     true,
+            liveBufferLatencyMaxLatency:  2.0,
+            liveBufferLatencyMinRemain:   0.5,
+            fixAudioTimestampGap:         true,
         }
-    </script>
+    );
+
+    player.attachMediaElement(video);
+
+    // ── mpegts events ─────────────────────────────────────────────────────────
+    player.on(mpegts.Events.ERROR, (errType, errDetail, errInfo) => {
+        console.warn('[player] error', errType, errDetail, errInfo);
+        scheduleRetry();
+    });
+
+    player.on(mpegts.Events.MEDIA_INFO, () => {
+        // Media info received means NMS accepted the FLV play request
+        dbgLog('media info received');
+    });
+
+    // ── HTML5 video events ────────────────────────────────────────────────────
+    video.addEventListener('playing', onPlaying,   { once: false });
+    video.addEventListener('waiting', onWaiting,   { once: false });
+    video.addEventListener('pause',   onPause,     { once: false });
+    video.addEventListener('error',   onVideoError,{ once: false });
+    video.addEventListener('ended',   scheduleRetry, { once: false });
+    video.addEventListener('stalled', onStalled,   { once: false });
+
+    player.load();
+    video.play().catch(() => {
+        // Autoplay blocked — user needs to click play; that's fine
+        setStatus('', '▶ Click play to start');
+    });
+}
+
+function onPlaying() {
+    hideOverlay();
+    setStatus('live', '🔴 LIVE');
+    setRetry(0);
+    retryCount = 0;
+    clearTimeout(retryTimer);
+}
+
+function onWaiting() {
+    setStatus('waiting', '⏳ Buffering…');
+}
+
+function onPause() {
+    if (!video.ended) setStatus('', '⏸ Paused');
+}
+
+function onVideoError() {
+    console.warn('[player] video element error', video.error);
+    scheduleRetry();
+}
+
+let stalledTimer = null;
+function onStalled() {
+    clearTimeout(stalledTimer);
+    stalledTimer = setTimeout(() => {
+        if (video.paused || video.ended) return;
+        dbgLog('stalled too long, reconnecting');
+        scheduleRetry(true);
+    }, 8000);
+}
+
+function scheduleRetry(immediate) {
+    clearTimeout(retryTimer);
+    clearTimeout(stalledTimer);
+    if (destroyed) return;
+
+    destroyPlayer();
+    retryCount++;
+    const delay = immediate ? 1500 : Math.min(1500 * Math.pow(1.6, retryCount - 1), MAX_DELAY);
+
+    showOverlay('📡', 'Stream offline or interrupted', `Retrying in ${Math.round(delay / 1000)}s… (attempt ${retryCount})`);
+    setStatus('error', `Waiting for stream… (retry #${retryCount} in ${Math.round(delay / 1000)}s)`);
+
+    retryTimer = setTimeout(connect, delay);
+}
+
+function dbgLog(...args) {
+    // Uncomment to enable client-side debug output:
+    // console.log('[streaming]', ...args);
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+connect();
+</script>
 </body>
 </html>
