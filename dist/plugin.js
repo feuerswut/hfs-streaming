@@ -1,54 +1,67 @@
-exports.version = 0.1;
-exports.description = "RTMP Live Streaming - ingest via RTMP (OBS etc.), serve HTTP-FLV with HTML5 player";
+exports.version = 0.9;
+exports.description = "RTMP Live Streaming — ingest via RTMP (OBS / ffmpeg), serve HTTP-FLV with HTML5 player";
 exports.apiRequired = 13;
 exports.repo = "feuerswut/hfs-streaming";
 
 exports.config = {
     rtmpPort: {
-        type: 'number', defaultValue: 1935,
-        helperText: "RTMP ingest port (point OBS / ffmpeg here)", xs: 6,
+        type: 'number', defaultValue: 1935, label: 'RTMP Port',
+        helperText: "TCP port OBS / ffmpeg pushes RTMP to. Restart plugin after changing.",
     },
-    internalHttpPort: {
-        type: 'number', defaultValue: 8979,
-        helperText: "Internal NMS HTTP port (not exposed publicly – pick any free port)", xs: 6,
+    streamApp: {
+        type: 'string', defaultValue: 'live', label: 'Stream App',
+        helperText: "RTMP application name. In OBS → Stream → Server: rtmp://YOUR_HOST:PORT/<app>",
     },
     streamKey: {
-        type: 'string', defaultValue: 'stream',
-        helperText: "Stream key. In OBS set Stream Key to this value.", xs: 6,
+        type: 'string', defaultValue: 'stream', label: 'Stream Key',
+        helperText: "Only this key is allowed to publish. In OBS → Stream → Stream Key: <key>",
     },
-    gopCache: {
-        type: 'boolean', defaultValue: true,
-        helperText: "Cache last keyframe group so new viewers get a frame instantly", xs: 6,
+    nmsLogLevel: {
+        type: 'select', defaultValue: 'error', label: 'NMS Log Level',
+        options: { 'Error (default)': 'error', 'Warn': 'warn', 'Info': 'info', 'Debug': 'debug', 'Trace': 'trace' },
+        helperText: "Node-Media-Server internal log verbosity. Lines are captured to the HFS console.",
     },
     debug: {
-        type: 'boolean', defaultValue: false,
-        helperText: "Pipe NMS internal logs + ingest events into HFS output panel", xs: 6,
+        type: 'boolean', defaultValue: false, label: 'Plugin Debug Logging',
+        helperText: "Log plugin-level events (connects, disconnects, key checks) to the HFS console.",
     },
 };
 
 exports.changelog = [
-    { version: 0.6, message: "Switched ingest to node-media-server (RTMP). HTTP-FLV output via mpegts.js player." },
+    { "version": 0.9, "message": "First WORKING version. Only use NMS code, dont run an instance of it." },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
-const http = require('http');
 const path = require('path');
 const fs   = require('fs');
 
-let _nms            = null;   // NodeMediaServer instance
-let _port           = 8979;   // kept in sync so proxy always knows where NMS listens
-let _debug          = false;  // toggled from config
-let _restoreConsole = null;   // cleanup fn for console intercept
-let _activeProxies  = new Set();
+// NMS sub-module paths — resolved relative to this plugin's node_modules.
+// We deliberately do NOT require the top-level 'node-media-server' package
+// because its NodeHttpServer constructor unconditionally pulls in 'express',
+// 'cors', and 'ws' which are not available in the HFS runtime.
+// Instead we use only the RTMP server + Context, which depend purely on
+// Node built-ins (net, crypto, querystring, …).
+const NMS_BASE = path.join(__dirname, 'node_modules', 'node-media-server', 'src');
 
+let _rtmpServer     = null;  // NodeRtmpServer instance
+let _Context        = null;  // NMS Context singleton reference
+let _debug          = false;
+let _restoreConsole = null;  // cleanup fn for console intercept
+
+// ─────────────────────────────────────────────────────────────────────────────
 function dbg(api, ...args) {
     if (_debug) api.log('[streaming]', ...args);
 }
 
 // Intercept Node's console so NMS's internal log lines appear in the HFS
-// output panel.  NMS writes via console.log / console.error directly.
-// We wrap both, prepend [nms], forward to api.log, then call the original.
+// output panel.  NMS writes via console.log directly.
+// We wrap it, prepend [nms], forward to api.log, then call the original.
 // Returns a restore function to be called on unload.
+//
+// NMS 4.x log format:  [<locale date string>] [LEVEL] message
+// e.g. on de-DE:       [22.5.2026, 10:30:45] [INFO] Rtmp Server listening …
+// The old regex /^\[\d{2}\/\d{2}\/\d{4}/ only matched en-GB/en-AU style dates.
+// New regex matches any NMS log line regardless of locale.
 function interceptConsole(api) {
     const origLog   = console.log;
     const origError = console.error;
@@ -56,21 +69,23 @@ function interceptConsole(api) {
 
     let isIntercepting = false;
 
+    const NMS_LINE = /^\[.*?\] \[(?:TRACE|DEBUG|INFO|WARN|ERROR)\] /;
+
     const wrap = (orig, level) => (...args) => {
         orig(...args); // Always output to the real terminal
-        
+
         if (isIntercepting) return;
 
         const line = args.map(a =>
             (typeof a === 'object' ? JSON.stringify(a) : String(a))
         ).join(' ');
 
-        // ONLY intercept lines that start with the NMS date format: [DD/MM/YYYY
-        if (/^\[\d{2}\/\d{2}\/\d{4}/.test(line)) {
+        // Only intercept lines that look like NMS log output
+        if (NMS_LINE.test(line)) {
             isIntercepting = true;
             try {
                 api.log(`[nms${level}] ${line}`);
-            } catch (_) { 
+            } catch (_) {
             } finally {
                 isIntercepting = false;
             }
@@ -91,76 +106,72 @@ function interceptConsole(api) {
 // ─────────────────────────────────────────────────────────────────────────────
 exports.init = api => {
 
-    const NodeMediaServer = require('node-media-server');
+    // ── Pull in only what we need from NMS (all use Node built-ins only) ─────
+    const Context        = require(path.join(NMS_BASE, 'core',   'context.js'));
+    const NodeRtmpServer = require(path.join(NMS_BASE, 'server', 'rtmp_server.js'));
+    const logger         = require(path.join(NMS_BASE, 'core',   'logger.js'));
 
-    const rtmpPort  = api.getConfig('rtmpPort')         || 1935;
-    const httpPort  = api.getConfig('internalHttpPort') || 8979;
-    const streamKey = api.getConfig('streamKey')        || 'stream';
-    const gopCache  = api.getConfig('gopCache')         ?? true;
-    _debug          = api.getConfig('debug')            ?? false;
-    _port           = httpPort;
+    _Context = Context;
+
+    const rtmpPort    = api.getConfig('rtmpPort')    || 1935;
+    const streamApp   = api.getConfig('streamApp')   || 'live';
+    const streamKey   = api.getConfig('streamKey')   || 'stream';
+    const nmsLogLevel = api.getConfig('nmsLogLevel') || 'error';
+    _debug            = api.getConfig('debug')       ?? false;
+
+    // ── Console intercept for NMS logs ────────────────────────────────────────
     _restoreConsole = interceptConsole(api);
 
-    // ── Load player.html from public/ ────────────────────────────────────────
-    const playerHtmlPath = path.join(__dirname, 'public', 'player.html');
-    let playerHtml = null;
-    try {
-        playerHtml = fs.readFileSync(playerHtmlPath, 'utf8');
-        api.log('[streaming] player.html loaded from public/player.html');
-    } catch (e) {
-        api.log('[streaming] WARNING: public/player.html not found – a notice will be served instead');
-    }
+    // ── Configure NMS Context (replaces old NodeMediaServer constructor) ──────
+    logger.level    = nmsLogLevel;
+    Context.config  = {
+        rtmp: { port: rtmpPort },
+        bind: '0.0.0.0',
+        // HTTP intentionally omitted — we serve FLV directly from the HFS
+        // middleware, so we never need NMS's express-based HTTP server.
+    };
 
-    // ── Start NMS ────────────────────────────────────────────────────────────
-    _nms = new NodeMediaServer({
-        logType: 1,   // 1 = errors only
-        rtmp: {
-            port:         rtmpPort,
-            chunk_size:   60000,
-            gop_cache:    gopCache,
-            ping:         30,
-            ping_timeout: 60,
-        },
-        http: {
-            port:         httpPort,
-            allow_origin: '*',
-        },
-    });
+    // ── Start RTMP server ─────────────────────────────────────────────────────
+    _rtmpServer = new NodeRtmpServer();
+    _rtmpServer.run();
+    api.log(`[streaming] RTMP listening on :${rtmpPort}`);
+    api.log(`[streaming] OBS → rtmp://THIS_SERVER:${rtmpPort}/${streamApp}   Key: ${streamKey}`);
 
-    // Enforce stream key; debug-log accepted ingests
-    _nms.on('prePublish', (idOrSession, streamPath) => {
-        // Bulletproof check: grab the session whether NMS passed an ID or the object itself
-        const session = typeof idOrSession === 'string' ? _nms.getSession(idOrSession) : idOrSession;
-        const path = streamPath || (session && session.publishStreamPath) || '';
-        
-        if (!path) return;
-
-        const incomingKey = path.split('/').pop();
-        if (incomingKey !== streamKey) {
-            api.log(`[streaming] rejected publish: bad key "${incomingKey}"`);
-            if (session && typeof session.reject === 'function') {
-                session.reject(); // Safely disconnect unauthorized users
-            }
+    // ── NMS event handlers (NMS 4.x always passes the session object) ─────────
+    Context.eventEmitter.on('prePublish', session => {
+        // session.streamApp and session.streamName are set in RtmpSession.onConnect
+        if (session.streamApp !== streamApp || session.streamName !== streamKey) {
+            api.log(`[streaming] rejected publish: bad app/key "${session.streamPath}" from ${session.ip}`);
+            // session.close() ends the socket; NMS cleans up via the 'close' event
+            try { session.close(); } catch (_) {}
         } else {
-            dbg(api, `ingest accepted – stream path: ${path}`);
+            dbg(api, `ingest accepted – ${session.streamPath} from ${session.ip}`);
         }
     });
 
-    _nms.on('postPublish', (idOrSession, streamPath) => {
-        const session = typeof idOrSession === 'string' ? _nms.getSession(idOrSession) : idOrSession;
-        const path = streamPath || (session && session.publishStreamPath) || '';
-        dbg(api, `ingest live (postPublish) – stream path: ${path}`);
+    Context.eventEmitter.on('postPublish', session => {
+        dbg(api, `ingest live – ${session.streamPath}`);
     });
 
-    _nms.on('donePublish', (idOrSession, streamPath) => {
-        const session = typeof idOrSession === 'string' ? _nms.getSession(idOrSession) : idOrSession;
-        const path = streamPath || (session && session.publishStreamPath) || '';
-        dbg(api, `ingest ended (donePublish) – stream path: ${path}`);
+    Context.eventEmitter.on('donePublish', session => {
+        dbg(api, `ingest ended – ${session.streamPath}`);
     });
 
-    _nms.run();
-    api.log(`[streaming] RTMP listening on :${rtmpPort}  |  NMS HTTP on :${httpPort}`);
-    api.log(`[streaming] OBS → rtmp://THIS_SERVER:${rtmpPort}/live (Key: ${streamKey})`);
+    // ── Load & prepare player.html ────────────────────────────────────────────
+    // The file contains {{STREAM_FLV_PATH}}, {{STREAM_APP}}, {{STREAM_KEY}}
+    // placeholders that we replace at startup so the player knows where to
+    // connect. STREAM_FLV_PATH is the public HFS path (/live/stream).
+    const playerHtmlPath = path.join(__dirname, 'public', 'player.html');
+    let playerHtml = null;
+    try {
+        playerHtml = fs.readFileSync(playerHtmlPath, 'utf8')
+            .replace('{{STREAM_FLV_PATH}}', '/live/stream')
+            .replace('{{STREAM_APP}}',      streamApp)
+            .replace('{{STREAM_KEY}}',      streamKey);
+        api.log('[streaming] player.html loaded from public/player.html');
+    } catch (e) {
+        api.log('[streaming] WARNING: public/player.html not found — a notice will be served instead');
+    }
 
     // ── HFS middleware ────────────────────────────────────────────────────────
     exports.middleware = async ctx => {
@@ -169,10 +180,10 @@ exports.init = api => {
         const liveIdx = ctx.path.indexOf('/live');
         if (liveIdx === -1) return;
 
-        const sub    = ctx.path.slice(liveIdx + 5);  // e.g. "" | "/stream"
+        const sub    = ctx.path.slice(liveIdx + 5);  // e.g. "" | "/stream" | "/health"
         const method = ctx.method.toUpperCase();
 
-        // GET /live  →  player page (or missing-file notice)
+        // ── GET /live  →  player page ─────────────────────────────────────────
         if (method === 'GET' && (sub === '' || sub === '/')) {
             ctx.status = 200;
             ctx.type   = 'text/html';
@@ -181,88 +192,164 @@ exports.init = api => {
             return;
         }
 
-        // GET /live/stream  →  proxy HTTP-FLV from NMS
+        // ── GET /live/stream  →  direct HTTP-FLV from NMS BroadcastServer ────
         if (method === 'GET' && sub === '/stream') {
-            const nmsUrl = `http://127.0.0.1:${_port}/live/${streamKey}.flv`;
-            await proxyFlv(ctx, nmsUrl);
+            const broadcastKey = `/${streamApp}/${streamKey}`;
+            const broadcast    = Context.broadcasts.get(broadcastKey);
+
+            if (!broadcast || !broadcast.publisher) {
+                // Stream is offline — let the player retry
+                ctx.status = 503;
+                ctx.type   = 'application/json';
+                ctx.set('Cache-Control', 'no-cache');
+                ctx.body   = JSON.stringify({ error: 'Stream offline', key: broadcastKey });
+                ctx.stop();
+                return;
+            }
+
+            await serveFLV(ctx, broadcast, api);
             ctx.stop();
             return;
         }
 
-        // GET /live/health  →  quick JSON status
+        // ── GET /live/health  →  quick JSON status ────────────────────────────
         if (method === 'GET' && sub === '/health') {
-            ctx.type = 'application/json';
+            const broadcastKey = `/${streamApp}/${streamKey}`;
+            const broadcast    = Context.broadcasts.get(broadcastKey);
+            const live         = !!(broadcast && broadcast.publisher);
+            ctx.type           = 'application/json';
             ctx.set('Cache-Control', 'no-cache');
-            ctx.body = JSON.stringify({ ok: true, rtmpPort, httpPort, streamKey });
+            ctx.body = JSON.stringify({ ok: true, live, rtmpPort, streamApp, streamKey });
             ctx.stop();
         }
     };
 
+    // ── Unload / cleanup ──────────────────────────────────────────────────────
     return {
         unload() {
-            if (_nms) {
-                _nms.stop();
-                _nms = null;
-            }
-            
-            // Clear the node-media-server module from memory
-            try {
-                const nmsPath = require.resolve('node-media-server');
-                delete require.cache[nmsPath];
-            } catch (e) {
-                // Module might already be gone
+            // 1. Remove all event listeners we registered so they don't fire
+            //    on a stale api object after reload.
+            Context.eventEmitter.removeAllListeners('prePublish');
+            Context.eventEmitter.removeAllListeners('postPublish');
+            Context.eventEmitter.removeAllListeners('donePublish');
+
+            // 2. Gracefully close every active session (RTMP + any FLV subscribers
+            //    that are internal NMS sessions — our custom HFS subscribers are
+            //    cleaned up by their own 'close' event handler below).
+            for (const session of Context.sessions.values()) {
+                try { session.close(); } catch (_) {}
             }
 
-            // Restore console and clear proxies as before...
-            if (_restoreConsole) _restoreConsole();
-            for (const req of _activeProxies) req.destroy();
+            // 3. Shut down the RTMP TCP server.
+            //    closeAllConnections() (Node 18.2+) immediately destroys open
+            //    sockets so the port is released without waiting for keep-alive.
+            if (_rtmpServer) {
+                try { _rtmpServer.tcpServer?.close(); }           catch (_) {}
+                try { _rtmpServer.tcpServer?.closeAllConnections?.(); } catch (_) {}
+                try { _rtmpServer.tlsServer?.close(); }           catch (_) {}
+                try { _rtmpServer.tlsServer?.closeAllConnections?.(); } catch (_) {}
+                _rtmpServer = null;
+            }
+
+            // 4. Reset NMS Context so a future reload starts with a clean slate.
+            Context.sessions.clear();
+            Context.broadcasts.clear();
+            _Context = null;
+
+            // 5. Purge every NMS module from the require cache so the next
+            //    require() call gets a fresh copy (including the Context singleton).
+            const nmsRoot = path.join(__dirname, 'node_modules', 'node-media-server');
+            for (const key of Object.keys(require.cache)) {
+                if (key.startsWith(nmsRoot)) {
+                    delete require.cache[key];
+                }
+            }
+
+            // 6. Restore console methods.
+            if (_restoreConsole) {
+                _restoreConsole();
+                _restoreConsole = null;
+            }
         },
     };
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Proxy NMS's HTTP-FLV response straight through to the HFS client.
+// Serve an HTTP-FLV live stream directly from the NMS BroadcastServer.
+//
+// Instead of reverse-proxying NMS's own HTTP server (which requires express /
+// cors / ws), we register the HFS response as a lightweight FLV "subscriber"
+// inside NMS's internal BroadcastServer.  postPlay() immediately sends the
+// cached FLV header + GOP frames so late-joiners see a frame instantly; all
+// subsequent packets are pushed via broadcastMessage → subscriber.sendBuffer().
+//
+// ctx.respond = false tells Koa not to touch the response after the middleware
+// returns, leaving the connection open for the lifetime of the stream.
 // ─────────────────────────────────────────────────────────────────────────────
-function proxyFlv(ctx, url) {
+function serveFLV(ctx, broadcast, api) {
     return new Promise(resolve => {
-        const req = http.get(url, res => {
-            // 1. Set status code manually
-            ctx.res.statusCode = res.statusCode || 200;
+        const id = 'hfs-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 
-            // 2. Set headers manually on the raw response object
-            ctx.res.setHeader('Content-Type', 'video/x-flv');
-            ctx.res.setHeader('Cache-Control', 'no-cache, no-store');
-            ctx.res.setHeader('Connection', 'keep-alive');
-            ctx.res.setHeader('X-Accel-Buffering', 'no');
-            ctx.res.setHeader('Access-Control-Allow-Origin', '*');
+        // Minimal session object that satisfies BroadcastServer's subscriber API.
+        const subscriber = {
+            id,
+            ip:          ctx.ip || '127.0.0.1',
+            isPublisher: false,
+            protocol:    'flv',
+            endTime:     0,
+            streamApp:   broadcast.publisher.streamApp,
+            streamName:  broadcast.publisher.streamName,
+            streamPath:  broadcast.publisher.streamPath,
 
-            // 3. Pipe the raw NMS stream directly to the client
-            res.pipe(ctx.res);
+            sendBuffer(buffer) {
+                try {
+                    if (!ctx.res.writableEnded && !ctx.res.destroyed) {
+                        ctx.res.write(buffer);
+                    }
+                } catch (_) {
+                    // Socket already gone; the 'close' event below handles cleanup.
+                }
+            },
+        };
 
-            // 4. Important: Tell HFS you have handled the response
-            // This prevents HFS from trying to process ctx.body later
-            ctx.res.finished = true; 
-            
-            resolve();
-
-            // Cleanup
-            ctx.req.on('close', () => {
-                req.destroy();
-                _activeProxies.delete(req);
-            });
+        // Take over the response — Koa must not try to finalise it after us.
+        ctx.respond = false;
+        ctx.res.writeHead(200, {
+            'Content-Type':            'video/x-flv',
+            'Cache-Control':           'no-cache, no-store',
+            'Connection':              'keep-alive',
+            'Transfer-Encoding':       'chunked',
+            'X-Accel-Buffering':       'no',
+            'Access-Control-Allow-Origin': '*',
         });
 
-        _activeProxies.add(req);
-
-        req.on('error', (err) => {
-            _activeProxies.delete(req);
-            // If headers weren't sent, we can safely send an error
-            if (!ctx.res.headersSent) {
-                ctx.res.writeHead(503, { 'Content-Type': 'application/json' });
-                ctx.res.end(JSON.stringify({ error: 'Stream unavailable' }));
-            }
+        // postPlay() synchronously writes the FLV header + any cached GOP frames
+        // to our subscriber (via sendBuffer above), then adds us to subscribers map.
+        const err = broadcast.postPlay(subscriber);
+        if (err) {
+            dbg(api, `postPlay rejected subscriber ${id}: ${err}`);
+            try { ctx.res.end(); } catch (_) {}
             resolve();
-        });
+            return;
+        }
+
+        dbg(api, `FLV subscriber ${id} connected for ${subscriber.streamPath} (ip: ${subscriber.ip})`);
+
+        // Clean up when the client closes the connection.
+        let cleaned = false;
+        const cleanup = () => {
+            if (cleaned) return;
+            cleaned = true;
+            dbg(api, `FLV subscriber ${id} disconnected`);
+            try { broadcast.donePlay(subscriber); } catch (_) {}
+        };
+
+        ctx.req.on('close', cleanup);
+        ctx.req.on('error', cleanup);
+        ctx.res.on('error', cleanup);
+
+        // Resolve now — the connection stays open via the subscriber until cleanup().
+        resolve();
     });
 }
 
