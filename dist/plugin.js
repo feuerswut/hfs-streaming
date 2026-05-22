@@ -40,7 +40,6 @@ exports.config = {
 };
 
 exports.changelog = [
-    { "version": 0.12, "message": "Add optional RTSP output via ffmpeg (VRChat / AVPro support)." },
     { "version": 0.11, "message": "Fix ERR_HTTP_HEADERS_SENT crash from koa-session running after FLV writeHead." },
     { "version": 0.9,  "message": "First WORKING version. Only use NMS code, dont run an instance of it." },
 ];
