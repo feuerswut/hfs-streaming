@@ -45,21 +45,20 @@ In HFS admin panel under "Streaming":
 
 | Setting | What it does | Default |
 |---------|------------|---------|
-| **maxBufferSize** | How much video to keep in memory (MB) | 200 |
-| **streamPath** | Where the stream lives (URL path) | /live |
-| **allowPublicIngest** | Can anyone send video? | No |
+| **rtmpPort** | TCP port OBS / ffmpeg pushes RTMP to | 1935 |
+| **streamApp** | RTMP application name (the part of the URL right after the host:port) | live |
+| **streamKey** | Only this key is allowed to publish | stream |
+| **nmsLogLevel** | Node-Media-Server internal log verbosity | error |
+| **debug** | Log plugin-level events (connects, disconnects, key checks) | off |
 
 ## Check if It's Working
 
 Open this in your browser:
 ```
-http://localhost:3000/live/stats
+http://localhost:3000/live/health
 ```
 
-You'll see:
-- How many people are watching
-- How much memory it's using
-- If it's streaming right now
+You'll see JSON with whether the stream is currently live, plus the active rtmpPort/streamApp/streamKey.
 
 ## Simple Example
 
