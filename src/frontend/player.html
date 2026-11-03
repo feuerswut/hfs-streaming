@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Stream</title>
+    <link rel="stylesheet" href="player.css">
+</head>
+<body>
+<div class="player-wrap">
+    <div class="video-shell">
+        <video id="video" playsinline muted autoplay></video>
+        <div class="overlay" id="overlay">
+            <div class="overlay-icon" id="overlay-icon">📡</div>
+            <div class="overlay-title" id="overlay-title">Waiting for stream…</div>
+            <div class="overlay-sub"  id="overlay-sub">Start streaming in OBS to begin</div>
+        </div>
+    </div>
+    <div class="status-bar">
+        <div class="dot" id="dot"></div>
+        <span id="status-text">Connecting…</span>
+        <span class="retry-badge" id="retry-badge"></span>
+        <span class="stream-url" id="stream-url"></span>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mpegts.js@1/dist/mpegts.min.js"></script>
+<script>
+// ── Config injected by plugin.js at serve-time ──────────────────────────────
+// These placeholders are string-replaced by plugin.js before the HTML is
+// sent (see the readFileSync().replace() chain around "player.html loaded").
+// player.js reads them off window.__STREAM_CONFIG__ at boot.
+window.__STREAM_CONFIG__ = {
+    flvPath: '{{STREAM_FLV_PATH}}',
+    app:     '{{STREAM_APP}}',
+    key:     '{{STREAM_KEY}}',
+};
+</script>
+<script src="player.js"></script>
+</body>
+</html>
