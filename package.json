@@ -3,8 +3,8 @@
   "private": true,
   "description": "RTMP live streaming plugin for HFS -- ingest via RTMP (OBS / ffmpeg), serve HTTP-FLV with an HTML5 player.",
   "scripts": {
-    "build": "node build/build.mjs",
-    "build:watch": "node build/build.mjs --watch",
+    "build": "node util/build.mjs",
+    "build:watch": "node util/build.mjs --watch",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

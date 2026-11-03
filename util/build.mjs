@@ -23,8 +23,8 @@
    the substitution to find.
 
    Usage:
-     node build/build.mjs            one-shot build
-     node build/build.mjs --watch    build, then rebuild on any src/ change
+     node util/build.mjs             one-shot build
+     node util/build.mjs --watch     build, then rebuild on any src/ change
    --------------------------------------------------------------------------- */
 
 import fs from 'node:fs'
